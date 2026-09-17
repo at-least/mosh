@@ -1,0 +1,1022 @@
+//! The state-synchronization engine (spec §6-§7) — pure, clock-driven,
+//! no sockets. [`SspSender`] owns our outgoing state (the client's
+//! [`UserStream`]) and produces encrypted-transport-ready fragments via
+//! the caller's [`super::fragment::Fragmenter`]; [`SspReceiver`] owns
+//! the peer's incoming state and enforces the idempotency/old-reference
+//! rules. The S3 session wires both to a UDP socket and a clock.
+
+use std::collections::VecDeque;
+use std::sync::Arc;
+
+use thiserror::Error;
+
+use super::fragment::{Fragment, Fragmenter};
+use super::wire::{
+    HostInstruction, HostMessage, TransportInstruction, UserInstruction, UserMessage, WireError,
+    MOSH_PROTOCOL_VERSION, SHUTDOWN_NUM,
+};
+
+/// ms between empty acks (transportsender.h ACK_INTERVAL).
+pub const ACK_INTERVAL_MS: u64 = 3000;
+/// ms a data ack may be delayed (ACK_DELAY).
+pub const ACK_DELAY_MS: u64 = 100;
+/// ms of silence after which we stop resending at frame rate
+/// (ACTIVE_RETRY_TIMEOUT).
+pub const ACTIVE_RETRY_TIMEOUT_MS: u64 = 10_000;
+/// Shutdown packets before giving up (SHUTDOWN_RETRIES).
+pub const SHUTDOWN_RETRIES: u32 = 16;
+/// Cap on the sender's unacked-state queue; culls from the middle so
+/// both ends (known receiver state, newest) survive.
+const SENT_QUEUE_CAP: usize = 32;
+/// Cap on the receiver's state queue before quenching.
+const RECEIVED_QUEUE_CAP: usize = 1024;
+const QUENCH_WINDOW_MS: u64 = 15_000;
+/// Default SEND_MINDELAY; the mosh client sets 1 ms for keystrokes.
+pub const SEND_MINDELAY_DEFAULT_MS: u64 = 8;
+pub const SEND_MINDELAY_CLIENT_MS: u64 = 1;
+
+/// Clamp of ceil(SRTT/2) — two frames per RTT, bounded (spec §6.1).
+pub fn send_interval_ms(srtt_ms: f64) -> u64 {
+    (srtt_ms / 2.0).ceil().clamp(20.0, 250.0) as u64
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum SspError {
+    #[error("peer protocol_version {0} != 2")]
+    ProtocolVersion(u32),
+    #[error("state diff failed to parse: {0}")]
+    BadDiff(String),
+}
+
+/// A state we send (client: [`UserStream`]; the test server: any log).
+pub trait SspSentState: Clone + PartialEq {
+    /// Bytes turning `existing` into `self`.
+    fn diff_from(&self, existing: &Self) -> Vec<u8>;
+    /// Drop the prefix everyone has acknowledged (rationalization).
+    fn subtract(&mut self, known_receiver: &Self);
+}
+
+/// A state we receive and apply diffs to (client: [`HostState`]).
+pub trait SspReceivedState: Clone {
+    fn apply_string(&mut self, diff: &[u8]) -> Result<(), WireError>;
+}
+
+#[derive(Clone, Debug)]
+pub struct TimestampedState<S> {
+    pub timestamp: u64,
+    pub num: u64,
+    pub state: S,
+}
+
+// --- UserStream (spec §7.1) ----------------------------------------------
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum UserEvent {
+    Byte(u8),
+    Resize { width: i32, height: i32 },
+}
+
+/// The append-only keystroke/resize log the client synchronizes out.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct UserStream {
+    events: Vec<UserEvent>,
+}
+
+impl UserStream {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push_bytes(&mut self, bytes: &[u8]) {
+        self.events
+            .extend(bytes.iter().map(|b| UserEvent::Byte(*b)));
+    }
+
+    pub fn push_resize(&mut self, width: i32, height: i32) {
+        self.events.push(UserEvent::Resize { width, height });
+    }
+
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    pub fn events(&self) -> &[UserEvent] {
+        &self.events
+    }
+
+    fn encode_suffix(&self, from: usize) -> Vec<u8> {
+        // consecutive bytes coalesce into one Keystroke instruction
+        // (user.cc diff_from)
+        let mut instructions = Vec::new();
+        for event in &self.events[from..] {
+            match *event {
+                UserEvent::Byte(b) => match instructions.last_mut() {
+                    Some(UserInstruction::Keystroke(keys)) => keys.push(b),
+                    _ => instructions.push(UserInstruction::Keystroke(vec![b])),
+                },
+                UserEvent::Resize { width, height } => {
+                    instructions.push(UserInstruction::Resize { width, height })
+                }
+            }
+        }
+        UserMessage { instructions }.encode()
+    }
+
+    fn common_prefix_len(&self, other: &UserStream) -> usize {
+        self.events
+            .iter()
+            .zip(other.events.iter())
+            .take_while(|(a, b)| a == b)
+            .count()
+    }
+}
+
+impl SspSentState for UserStream {
+    fn diff_from(&self, existing: &Self) -> Vec<u8> {
+        self.encode_suffix(self.common_prefix_len(existing))
+    }
+
+    fn subtract(&mut self, known_receiver: &Self) {
+        if self == known_receiver {
+            self.events.clear();
+            return;
+        }
+        let prefix = self.common_prefix_len(known_receiver);
+        self.events.drain(..prefix);
+    }
+}
+
+impl SspReceivedState for UserStream {
+    fn apply_string(&mut self, diff: &[u8]) -> Result<(), WireError> {
+        let message = UserMessage::decode(diff)?;
+        for instruction in message.instructions {
+            match instruction {
+                UserInstruction::Keystroke(keys) => {
+                    self.push_bytes(&keys);
+                }
+                UserInstruction::Resize { width, height } => {
+                    self.push_resize(width, height);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// --- HostStreamState (spec §7.2) ------------------------------------------
+
+/// One event in the server-synchronized host stream, in order.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum HostEvent {
+    /// Terminal escape bytes for the client's emulator.
+    Bytes(Vec<u8>),
+    Resize {
+        width: i32,
+        height: i32,
+    },
+}
+
+/// A persistent (cons-list) log of host events. The server's state
+/// chain BRANCHES: an instruction `[old=>new]` paints from `old`, so
+/// the client's states form a tree of byte logs, all sharing the main
+/// trunk. Structural sharing keeps per-state clones O(1) (a snapshot
+/// per received state, like mosh's per-state emulator copies) while
+/// the unique memory stays one copy of the traffic.
+#[derive(Clone, Debug)]
+pub struct EventLog {
+    node: Option<Arc<LogNode>>,
+    len: usize,
+}
+
+#[derive(Debug)]
+struct LogNode {
+    parent: Option<Arc<LogNode>>,
+    event: HostEvent,
+}
+
+impl EventLog {
+    pub fn new() -> Self {
+        EventLog { node: None, len: 0 }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn push(&mut self, event: HostEvent) {
+        self.node = Some(Arc::new(LogNode {
+            parent: self.node.clone(),
+            event,
+        }));
+        self.len += 1;
+    }
+
+    /// The events in order (rebuild replay order).
+    pub fn iter(&self) -> Vec<&HostEvent> {
+        let mut out = Vec::with_capacity(self.len);
+        let mut cursor = self.node.as_deref();
+        while let Some(node) = cursor {
+            out.push(&node.event);
+            cursor = node.parent.as_deref();
+        }
+        out.reverse();
+        out
+    }
+
+    /// The suffix this log carries over `base`, if `base` is an
+    /// ancestor (a structural prefix, checked by pointer identity at
+    /// the shared depth). None = the logs diverged: rebuild instead.
+    pub fn suffix_over<'a>(&'a self, base: &EventLog) -> Option<Vec<&'a HostEvent>> {
+        if base.len > self.len {
+            return None;
+        }
+        let mut cursor = self.node.as_deref();
+        let mut back = self.len;
+        while back > base.len {
+            cursor = cursor?.parent.as_deref();
+            back -= 1;
+        }
+        let shares_trunk = match (&base.node, cursor) {
+            (None, None) => true,
+            (Some(a), Some(b)) => std::ptr::eq(a.as_ref(), b),
+            _ => false,
+        };
+        if !shares_trunk {
+            return None;
+        }
+        let mut suffix = Vec::with_capacity(self.len - base.len);
+        let mut cursor = self.node.as_deref();
+        let mut back = self.len;
+        while back > base.len {
+            let node = cursor?;
+            suffix.push(&node.event);
+            cursor = node.parent.as_deref();
+            back -= 1;
+        }
+        suffix.reverse();
+        Some(suffix)
+    }
+}
+
+impl Default for EventLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The server-synchronized state as the client holds it (spec §7.2).
+///
+/// The client's copy of the server state is a pure EVENT LOG (not an
+/// emulator snapshot): the server's outgoing states form a TREE of
+/// byte logs (an instruction paints from its old_num base, which is
+/// not necessarily the previous newest state), all sharing the trunk.
+/// Each received state carries its own [`EventLog`] branch — O(1)
+/// clones, like mosh's per-state emulator copies — and the display
+/// feeds the suffix over its current position, or rebuilds from the
+/// full log when the newest state branched elsewhere. `echo_ack`
+/// rides along (the server's echo-ack counter, monotonic).
+#[derive(Clone, Debug, Default)]
+pub struct HostStreamState {
+    pub log: EventLog,
+    pub echo_ack: u64,
+}
+
+impl HostStreamState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Total host bytes in the log (test/reporting convenience).
+    pub fn byte_len(&self) -> usize {
+        self.log
+            .iter()
+            .iter()
+            .map(|e| match e {
+                HostEvent::Bytes(b) => b.len(),
+                HostEvent::Resize { .. } => 0,
+            })
+            .sum()
+    }
+}
+
+impl SspReceivedState for HostStreamState {
+    fn apply_string(&mut self, diff: &[u8]) -> Result<(), WireError> {
+        let message = HostMessage::decode(diff)?;
+        for instruction in message.instructions {
+            match instruction {
+                HostInstruction::HostBytes(bytes) => {
+                    if !bytes.is_empty() {
+                        self.log.push(HostEvent::Bytes(bytes));
+                    }
+                }
+                HostInstruction::Resize { width, height } => {
+                    self.log.push(HostEvent::Resize { width, height });
+                }
+                HostInstruction::EchoAck(num) => self.echo_ack = self.echo_ack.max(num),
+            }
+        }
+        Ok(())
+    }
+}
+
+// --- sender ---------------------------------------------------------------
+
+/// Drives our outgoing state: what to send, when, and against which
+/// assumed receiver state (spec §6.1). Pure — the caller owns the clock
+/// and delivers fragments.
+pub struct SspSender<S: SspSentState> {
+    current_state: S,
+    sent_states: VecDeque<TimestampedState<S>>,
+    assumed_receiver: usize,
+    ack_num: u64,
+    next_ack_time: u64,
+    next_send_time: Option<u64>,
+    mindelay_clock: Option<u64>,
+    pending_data_ack: bool,
+    shutdown_in_progress: bool,
+    shutdown_tries: u32,
+    shutdown_start: Option<u64>,
+    last_heard: u64,
+    send_mindelay: u64,
+}
+
+impl<S: SspSentState> SspSender<S> {
+    pub fn new(initial_state: S, now: u64, send_mindelay: u64) -> Self {
+        SspSender {
+            current_state: initial_state.clone(),
+            sent_states: VecDeque::from([TimestampedState {
+                timestamp: now,
+                num: 0,
+                state: initial_state,
+            }]),
+            assumed_receiver: 0,
+            ack_num: 0,
+            next_ack_time: now + ACK_INTERVAL_MS,
+            next_send_time: None,
+            mindelay_clock: None,
+            pending_data_ack: false,
+            shutdown_in_progress: false,
+            shutdown_tries: 0,
+            shutdown_start: None,
+            last_heard: now,
+            send_mindelay,
+        }
+    }
+
+    /// The live outgoing state. Pushes after `start_shutdown` are a bug.
+    pub fn current_state(&mut self) -> &mut S {
+        debug_assert!(!self.shutdown_in_progress, "state frozen during shutdown");
+        &mut self.current_state
+    }
+
+    pub fn set_current_state(&mut self, state: S) {
+        debug_assert!(!self.shutdown_in_progress, "state frozen during shutdown");
+        self.current_state = state;
+    }
+
+    pub fn start_shutdown(&mut self, now: u64) {
+        if !self.shutdown_in_progress {
+            self.shutdown_start = Some(now);
+            self.shutdown_in_progress = true;
+        }
+    }
+
+    pub fn shutdown_in_progress(&self) -> bool {
+        self.shutdown_in_progress
+    }
+
+    /// Our shutdown was acknowledged (the ack culls everything below the
+    /// shutdown state, so it sits at the front).
+    pub fn shutdown_acknowledged(&self) -> bool {
+        self.sent_states.front().map(|s| s.num) == Some(SHUTDOWN_NUM)
+    }
+
+    /// We have acknowledged the peer's shutdown (an ack_num of MAX went
+    /// out — the receiver raises ack_num to MAX on seeing the peer's
+    /// shutdown state).
+    pub fn counterparty_shutdown_acknowledged(&self, fragmenter: &Fragmenter) -> bool {
+        fragmenter.last_ack_sent() == Some(SHUTDOWN_NUM)
+    }
+
+    pub fn shutdown_ack_timed_out(&self, now: u64) -> bool {
+        if self.shutdown_in_progress {
+            if self.shutdown_tries >= SHUTDOWN_RETRIES {
+                return true;
+            }
+            if let Some(start) = self.shutdown_start {
+                return now - start >= ACTIVE_RETRY_TIMEOUT_MS;
+            }
+        }
+        false
+    }
+
+    /// Timestamp of the oldest state the peer has acked (round-trip
+    /// evidence for roaming, spec §8).
+    pub fn sent_state_acked_timestamp(&self) -> u64 {
+        self.sent_states.front().map(|s| s.timestamp).unwrap_or(0)
+    }
+
+    pub fn sent_state_acked(&self) -> u64 {
+        self.sent_states.front().map(|s| s.num).unwrap_or(0)
+    }
+
+    pub fn sent_state_last(&self) -> u64 {
+        self.sent_states.back().map(|s| s.num).unwrap_or(0)
+    }
+
+    /// The peer's ack: drop everything strictly below `ack_num`. An ack
+    /// naming a culled state is ignored wholesale (idempotency, §6.2).
+    pub fn process_acknowledgment_through(&mut self, ack: u64) {
+        if !self.sent_states.iter().any(|s| s.num == ack) {
+            return;
+        }
+        self.sent_states.retain(|s| s.num >= ack);
+        debug_assert!(!self.sent_states.is_empty());
+        self.assumed_receiver = self.assumed_receiver.min(self.sent_states.len() - 1);
+    }
+
+    /// The receiver's newest state number (piggybacked as ack_num).
+    pub fn set_ack_num(&mut self, ack: u64) {
+        self.ack_num = ack;
+    }
+
+    /// A received instruction carried data: schedule a delayed ack.
+    pub fn set_data_ack(&mut self) {
+        self.pending_data_ack = true;
+    }
+
+    /// We heard from the peer at `ts` (feeds the retry-timeout branch).
+    pub fn remote_heard(&mut self, ts: u64) {
+        self.last_heard = ts;
+    }
+
+    fn update_assumed_receiver_state(&mut self, now: u64, rto: u64) {
+        self.assumed_receiver = 0;
+        for i in 1..self.sent_states.len() {
+            // benefit of the doubt to states sent recently enough
+            if now - self.sent_states[i].timestamp < rto + ACK_DELAY_MS {
+                self.assumed_receiver = i;
+            } else {
+                return;
+            }
+        }
+    }
+
+    fn rationalize_states(&mut self) {
+        if self.sent_states.len() < 2 {
+            return;
+        }
+        let known = self.sent_states.front().unwrap().state.clone();
+        self.current_state.subtract(&known);
+        for state in &mut self.sent_states {
+            state.state.subtract(&known);
+        }
+    }
+
+    /// ms until the next send/ack event: 0 when something is already
+    /// overdue, `u64::MAX` when nothing is scheduled (mosh's INT_MAX).
+    pub fn wait_time(&mut self, now: u64, rto: u64, send_interval: u64) -> u64 {
+        let (next_send, next_ack) = self.compute_timers(now, rto, send_interval);
+        let earliest = match (next_send, next_ack) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        earliest.map_or(u64::MAX, |t| t.saturating_sub(now))
+    }
+
+    /// Timer recomputation shared by `wait_time` and `tick`. Mirrors
+    /// mosh's `calculate_timers`: the delayed-ack deadline is PERSISTED
+    /// (so it actually fires 100 ms after data arrives, not 3 s later),
+    /// and the mindelay clock starts the moment state diverges.
+    fn compute_timers(
+        &mut self,
+        now: u64,
+        rto: u64,
+        send_interval: u64,
+    ) -> (Option<u64>, Option<u64>) {
+        if self.pending_data_ack && self.next_ack_time > now + ACK_DELAY_MS {
+            self.next_ack_time = now + ACK_DELAY_MS;
+        }
+        let back = self.sent_states.back().expect("sent_states never empty");
+        if self.current_state != back.state && self.mindelay_clock.is_none() {
+            self.mindelay_clock = Some(now);
+        }
+        let next_send = if self.current_state != back.state {
+            let floor = self.mindelay_clock.map_or(now, |m| m + self.send_mindelay);
+            Some(floor.max(back.timestamp + send_interval))
+        } else if self.current_state != self.sent_states[self.assumed_receiver].state
+            && self.last_heard + ACTIVE_RETRY_TIMEOUT_MS > now
+        {
+            let mut t = back.timestamp + send_interval;
+            if let Some(m) = self.mindelay_clock {
+                t = t.max(m + self.send_mindelay);
+            }
+            Some(t)
+        } else if self.sent_states.len() > 1
+            && self.current_state != self.sent_states.front().unwrap().state
+            && self.last_heard + ACTIVE_RETRY_TIMEOUT_MS > now
+        {
+            Some(back.timestamp + rto + ACK_DELAY_MS)
+        } else {
+            None
+        };
+
+        if self.shutdown_in_progress || self.ack_num == SHUTDOWN_NUM {
+            self.next_ack_time = back.timestamp + send_interval;
+        }
+        (next_send, Some(self.next_ack_time))
+    }
+
+    /// mosh's `tick`: send a diff or an empty ack if one is due. Due
+    /// fragments are appended to `out` (already sliced and identified —
+    /// hand them to the crypto layer one datagram each).
+    pub fn tick(
+        &mut self,
+        now: u64,
+        rto: u64,
+        send_interval: u64,
+        mtu: usize,
+        fragmenter: &mut Fragmenter,
+        out: &mut Vec<Fragment>,
+    ) -> Result<(), SspError> {
+        self.update_assumed_receiver_state(now, rto);
+        self.rationalize_states();
+        let (next_send, next_ack) = self.compute_timers(now, rto, send_interval);
+
+        let due_send = next_send.is_some_and(|t| now >= t);
+        let due_ack = next_ack.is_some_and(|t| now >= t);
+        if !due_send && !due_ack {
+            return Ok(());
+        }
+
+        let mut diff = self
+            .current_state
+            .diff_from(&self.sent_states[self.assumed_receiver].state);
+        self.attempt_prospective_resend_optimization(&mut diff);
+
+        if diff.is_empty() {
+            if due_ack {
+                self.send_empty_ack(now, mtu, fragmenter, out);
+                self.mindelay_clock = None;
+            }
+            if due_send {
+                self.next_send_time = None;
+                self.mindelay_clock = None;
+            }
+        } else if due_send || due_ack {
+            self.send_to_receiver(now, &diff, mtu, fragmenter, out);
+            self.mindelay_clock = None;
+        }
+        Ok(())
+    }
+
+    fn attempt_prospective_resend_optimization(&mut self, proposed_diff: &mut Vec<u8>) {
+        if self.assumed_receiver == 0 || self.sent_states.len() < 2 {
+            return;
+        }
+        let front = self.sent_states.front().unwrap().state.clone();
+        let resend_diff = self.current_state.diff_from(&front);
+        if resend_diff.len() <= proposed_diff.len()
+            || (resend_diff.len() < 1000 && resend_diff.len() - proposed_diff.len() < 100)
+        {
+            self.assumed_receiver = 0;
+            *proposed_diff = resend_diff;
+        }
+    }
+
+    fn add_sent_state(&mut self, timestamp: u64, num: u64, state: S) {
+        self.sent_states.push_back(TimestampedState {
+            timestamp,
+            num,
+            state,
+        });
+        if self.sent_states.len() > SENT_QUEUE_CAP {
+            // cull from the middle, exactly mosh's erase(end()-16): the
+            // known-receiver head and the newest 15 states survive
+            let idx = self.sent_states.len() - 16;
+            self.sent_states.remove(idx);
+            if self.assumed_receiver >= idx {
+                // the assumption just lost its target: fall back to the
+                // known-receiver head rather than silently pointing at a
+                // newer state the peer may not have
+                self.assumed_receiver = 0;
+            }
+        }
+    }
+
+    fn send_empty_ack(
+        &mut self,
+        now: u64,
+        mtu: usize,
+        fragmenter: &mut Fragmenter,
+        out: &mut Vec<Fragment>,
+    ) {
+        let new_num = if self.shutdown_in_progress {
+            SHUTDOWN_NUM
+        } else {
+            self.sent_states.back().unwrap().num + 1
+        };
+        let state = self.current_state.clone();
+        self.add_sent_state(now, new_num, state);
+        self.send_in_fragments(b"", new_num, mtu, fragmenter, out);
+        self.next_ack_time = now + ACK_INTERVAL_MS;
+        self.next_send_time = None;
+    }
+
+    fn send_to_receiver(
+        &mut self,
+        now: u64,
+        diff: &[u8],
+        mtu: usize,
+        fragmenter: &mut Fragmenter,
+        out: &mut Vec<Fragment>,
+    ) {
+        let mut new_num = if self.current_state == self.sent_states.back().unwrap().state {
+            self.sent_states.back().unwrap().num
+        } else {
+            self.sent_states.back().unwrap().num + 1
+        };
+        if self.shutdown_in_progress {
+            new_num = SHUTDOWN_NUM;
+        }
+        if new_num == self.sent_states.back().unwrap().num {
+            self.sent_states.back_mut().unwrap().timestamp = now;
+        } else {
+            let state = self.current_state.clone();
+            self.add_sent_state(now, new_num, state);
+        }
+        self.send_in_fragments(diff, new_num, mtu, fragmenter, out);
+        self.assumed_receiver = self.sent_states.len() - 1;
+        self.next_ack_time = now + ACK_INTERVAL_MS;
+        self.next_send_time = None;
+    }
+
+    fn send_in_fragments(
+        &mut self,
+        diff: &[u8],
+        new_num: u64,
+        mtu: usize,
+        fragmenter: &mut Fragmenter,
+        out: &mut Vec<Fragment>,
+    ) {
+        let inst = TransportInstruction {
+            protocol_version: MOSH_PROTOCOL_VERSION,
+            old_num: self.sent_states[self.assumed_receiver].num,
+            new_num,
+            ack_num: self.ack_num,
+            throwaway_num: self.sent_states.front().unwrap().num,
+            diff: diff.to_vec(),
+            // chaff: conch sends none (spec §9); the field stays default
+            chaff: Vec::new(),
+        };
+        if new_num == SHUTDOWN_NUM {
+            self.shutdown_tries += 1;
+        }
+        if let Ok(fragments) = fragmenter.make_fragments(&inst, mtu) {
+            out.extend(fragments);
+        }
+        self.pending_data_ack = false;
+    }
+}
+
+// --- receiver -------------------------------------------------------------
+
+/// What the receiver did with an instruction (spec §6.2); the session
+/// layer acts on the ack/data-ack hints.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RecvOutcome<S> {
+    /// Newest state appended: raise our outbound ack to `num`.
+    Latest { num: u64, had_diff: bool, state: S },
+    /// Older state inserted into place (no ack update, no data-ack hint).
+    OutOfOrder { num: u64, had_diff: bool },
+    /// new_num already known (idempotent retransmission).
+    Duplicate,
+    /// old_num no longer held (or never seen) — drop, security-sensitive.
+    NoReference,
+    /// Over the queue cap outside the 15 s admit window.
+    Quenched,
+}
+
+pub struct SspReceiver<S: SspReceivedState> {
+    received: VecDeque<TimestampedState<S>>,
+    quench_until: u64,
+}
+
+impl<S: SspReceivedState> SspReceiver<S> {
+    pub fn new(initial: S, now: u64) -> Self {
+        SspReceiver {
+            received: VecDeque::from([TimestampedState {
+                timestamp: now,
+                num: 0,
+                state: initial,
+            }]),
+            quench_until: 0,
+        }
+    }
+
+    pub fn latest(&self) -> &TimestampedState<S> {
+        self.received.back().expect("received never empty")
+    }
+
+    pub fn latest_state(&self) -> &S {
+        &self.latest().state
+    }
+
+    pub fn state_count(&self) -> usize {
+        self.received.len()
+    }
+
+    fn process_throwaway_until(&mut self, throwaway_num: u64) -> bool {
+        // emptying the queue would break the state machine's invariants;
+        // a hostile throwaway is refused without culling instead (mosh
+        // fatal_asserts here — our hardening difference, spec §9)
+        if !self.received.iter().any(|s| s.num >= throwaway_num) {
+            return false;
+        }
+        self.received.retain(|s| s.num >= throwaway_num);
+        true
+    }
+
+    /// Apply one decoded instruction arriving at time `now`.
+    pub fn process_instruction(
+        &mut self,
+        inst: &TransportInstruction,
+        now: u64,
+    ) -> Result<RecvOutcome<S>, SspError> {
+        if inst.protocol_version != MOSH_PROTOCOL_VERSION {
+            return Err(SspError::ProtocolVersion(inst.protocol_version));
+        }
+        if self.received.iter().any(|s| s.num == inst.new_num) {
+            return Ok(RecvOutcome::Duplicate);
+        }
+        if !self.received.iter().any(|s| s.num == inst.old_num) {
+            return Ok(RecvOutcome::NoReference);
+        }
+        if !self.process_throwaway_until(inst.throwaway_num) {
+            return Ok(RecvOutcome::NoReference);
+        }
+        // re-locate after the cull (indices shifted); a throwaway that
+        // culls everything (hostile — a peer never sends one past its own
+        // new_num) drops the instruction rather than emptying the queue
+        let Some(reference) = self.received.iter().position(|s| s.num == inst.old_num) else {
+            return Ok(RecvOutcome::NoReference);
+        };
+
+        if self.received.len() > RECEIVED_QUEUE_CAP && now < self.quench_until {
+            return Ok(RecvOutcome::Quenched);
+        } else if self.received.len() > RECEIVED_QUEUE_CAP {
+            self.quench_until = now + QUENCH_WINDOW_MS;
+        }
+
+        let mut new_state = self.received[reference].clone();
+        new_state.timestamp = now;
+        new_state.num = inst.new_num;
+        let had_diff = !inst.diff.is_empty();
+        if had_diff {
+            new_state
+                .state
+                .apply_string(&inst.diff)
+                .map_err(|e| SspError::BadDiff(e.to_string()))?;
+        }
+
+        // sorted insert: append if newest, else slot into place
+        if self.received.back().is_some_and(|s| s.num < new_state.num) {
+            let num = new_state.num;
+            self.received.push_back(new_state.clone());
+            Ok(RecvOutcome::Latest {
+                num,
+                had_diff,
+                state: new_state.state,
+            })
+        } else {
+            let num = new_state.num;
+            let position = self
+                .received
+                .iter()
+                .position(|s| s.num > new_state.num)
+                .unwrap_or(self.received.len());
+            self.received.insert(position, new_state);
+            Ok(RecvOutcome::OutOfOrder { num, had_diff })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fragment::{Fragment, FragmentAssembly};
+
+    #[test]
+    fn user_stream_diff_subtract_roundtrip() {
+        let mut a = UserStream::new();
+        a.push_bytes(b"echo hi\r");
+        a.push_resize(100, 30);
+
+        let empty = UserStream::new();
+        let diff = a.diff_from(&empty);
+        let mut b = UserStream::new();
+        b.apply_string(&diff).unwrap();
+        assert_eq!(a, b, "diff from empty reconstructs the whole stream");
+
+        // incremental diff after the peer holds a prefix
+        let mut partial = UserStream::new();
+        partial.push_bytes(b"echo ");
+        let mut c = a.clone();
+        c.subtract(&partial);
+        assert_eq!(c.len(), 4, "\"hi\\r\" (3) + the resize remain");
+        let delta = a.diff_from(&partial);
+        let mut d = partial.clone();
+        d.apply_string(&delta).unwrap();
+        assert_eq!(a, d);
+
+        // coalescing: one run of bytes becomes one keystroke instruction
+        let msg = UserMessage::decode(&a.diff_from(&UserStream::new())).unwrap();
+        assert_eq!(msg.instructions.len(), 2, "bytes coalesce; resize separate");
+    }
+
+    #[test]
+    fn host_stream_state_applies_all_three_instruction_kinds() {
+        let mut host = HostStreamState::new();
+        let message = HostMessage {
+            instructions: vec![
+                HostInstruction::Resize {
+                    width: 80,
+                    height: 24,
+                },
+                HostInstruction::HostBytes(b"\x1b[1;1Hhi".to_vec()),
+                HostInstruction::EchoAck(7),
+                HostInstruction::EchoAck(5), // regressions never lower it
+                HostInstruction::HostBytes(Vec::new()), // empties are dropped
+            ],
+        };
+        host.apply_string(&message.encode()).unwrap();
+        let events = host.log.iter();
+        assert_eq!(events.len(), 2, "resize + one byte event, in order");
+        assert!(matches!(
+            events[0],
+            HostEvent::Resize {
+                width: 80,
+                height: 24
+            }
+        ));
+        assert!(matches!(&events[1], HostEvent::Bytes(b) if b == b"\x1b[1;1Hhi"));
+        assert_eq!(host.byte_len(), 8);
+        assert_eq!(host.echo_ack, 7);
+    }
+
+    /// The delayed-ack deadline must PERSIST (review finding: a local
+    /// computation pushed the ack out to the full 3 s interval). Data
+    /// arriving at t=0 must produce an ack by t=101, not t=3001.
+    #[test]
+    fn delayed_ack_fires_100ms_after_data() {
+        let mut sender: SspSender<UserStream> = SspSender::new(UserStream::new(), 0, 1);
+        sender.set_data_ack(); // the receiver saw a diff at t=0
+                               // mosh anchors the deadline at the first timer pass after the
+                               // flag — in the real loop that is the very next tick
+        assert_eq!(sender.wait_time(0, 120, 20), 100);
+
+        let wait_at_50 = sender.wait_time(50, 120, 20);
+        assert_eq!(wait_at_50, 50, "the deadline persisted, not recomputed");
+
+        let mut fragmenter = Fragmenter::default();
+        let mut out = Vec::new();
+        sender
+            .tick(101, 120, 20, 1200, &mut fragmenter, &mut out)
+            .unwrap();
+        assert!(!out.is_empty(), "the delayed ack went out at t=101");
+        // an empty-ack still advances the state number
+        let frag = Fragment::parse(&out[0].tostring()).unwrap();
+        let mut assembly = FragmentAssembly::new();
+        let inst = assembly.add_fragment(frag).unwrap();
+        assert_eq!(inst.protocol_version, 2);
+        assert_eq!(inst.new_num, 1);
+        assert!(inst.diff.is_empty());
+    }
+
+    /// The mindelay clock starts the moment state diverges (review
+    /// finding: it used to start only once a send was already due). A
+    /// change at t=15 (back.ts=0, interval=20, mindelay=8) has floor
+    /// max(15+8, 0+20) = 23 — mindelay binds, so a send at t=20..22
+    /// proves the bug and one at t=23 proves the fix.
+    #[test]
+    fn mindelay_batches_a_freshly_changed_state() {
+        let mut sender: SspSender<UserStream> = SspSender::new(UserStream::new(), 0, 8);
+        let mut fragmenter = Fragmenter::default();
+        let mut out = Vec::new();
+        for t in 0..15u64 {
+            sender
+                .tick(t, 120, 20, 1200, &mut fragmenter, &mut out)
+                .unwrap();
+        }
+        sender.current_state().push_bytes(b"a");
+        for t in 15..23u64 {
+            sender
+                .tick(t, 120, 20, 1200, &mut fragmenter, &mut out)
+                .unwrap();
+        }
+        assert!(out.is_empty(), "held past the interval bound (t=20..22)");
+        sender
+            .tick(23, 120, 20, 1200, &mut fragmenter, &mut out)
+            .unwrap();
+        assert!(!out.is_empty(), "send goes out at the mindelay bound");
+    }
+
+    #[test]
+    fn receiver_idempotency_and_reference_rules() {
+        let mut rx = SspReceiver::new(UserStream::new(), 0);
+
+        let inst = |old: u64, new: u64, diff: &[u8]| TransportInstruction {
+            protocol_version: 2,
+            old_num: old,
+            new_num: new,
+            ack_num: 0,
+            throwaway_num: 0,
+            diff: diff.to_vec(),
+            chaff: vec![],
+        };
+        let hello = UserMessage {
+            instructions: vec![UserInstruction::Keystroke(b"hi".to_vec())],
+        }
+        .encode();
+
+        assert!(matches!(
+            rx.process_instruction(&inst(0, 1, &hello), 10).unwrap(),
+            RecvOutcome::Latest {
+                num: 1,
+                had_diff: true,
+                ..
+            }
+        ));
+        // same state again: duplicate, not a second application
+        assert_eq!(
+            rx.process_instruction(&inst(0, 1, &hello), 11).unwrap(),
+            RecvOutcome::Duplicate
+        );
+        // references a state we never held
+        assert_eq!(
+            rx.process_instruction(&inst(99, 100, &hello), 12).unwrap(),
+            RecvOutcome::NoReference
+        );
+        // wrong protocol version is session-fatal
+        let mut old_proto = inst(0, 2, b"");
+        old_proto.protocol_version = 0;
+        assert_eq!(
+            rx.process_instruction(&old_proto, 13).unwrap_err(),
+            SspError::ProtocolVersion(0)
+        );
+
+        // out-of-order arrival: state 3 first, then the older state 2
+        // lands mid-queue without becoming "latest" or re-acking
+        let xyz = UserMessage {
+            instructions: vec![UserInstruction::Keystroke(b"XYZ".to_vec())],
+        }
+        .encode();
+        let ab = UserMessage {
+            instructions: vec![UserInstruction::Keystroke(b"AB".to_vec())],
+        }
+        .encode();
+        assert!(matches!(
+            rx.process_instruction(&inst(1, 3, &xyz), 14).unwrap(),
+            RecvOutcome::Latest { num: 3, .. }
+        ));
+        assert!(matches!(
+            rx.process_instruction(&inst(0, 2, &ab), 15).unwrap(),
+            RecvOutcome::OutOfOrder { num: 2, .. }
+        ));
+        assert_eq!(rx.latest().num, 3, "3 stays newest");
+        assert_eq!(rx.state_count(), 4);
+    }
+
+    #[test]
+    fn throwaway_culls_but_never_empties() {
+        let mut rx = SspReceiver::new(UserStream::new(), 0);
+        let inst = |old: u64, new: u64, tw: u64| TransportInstruction {
+            protocol_version: 2,
+            old_num: old,
+            new_num: new,
+            ack_num: 0,
+            throwaway_num: tw,
+            diff: vec![],
+            chaff: vec![],
+        };
+        rx.process_instruction(&inst(0, 1, 0), 1).unwrap();
+        rx.process_instruction(&inst(1, 2, 0), 2).unwrap();
+        rx.process_instruction(&inst(2, 3, 1), 3).unwrap(); // cull <1
+        assert_eq!(rx.state_count(), 3); // states 1,2,3
+                                         // a hostile throwaway that would cull everything drops the
+                                         // instruction instead of emptying the queue (mosh aborts here)
+        assert_eq!(
+            rx.process_instruction(&inst(3, 4, 99), 4).unwrap(),
+            RecvOutcome::NoReference
+        );
+        assert_eq!(rx.latest().num, 3, "the queue survives untouched");
+    }
+}
