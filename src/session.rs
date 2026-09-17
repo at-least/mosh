@@ -230,6 +230,7 @@ impl<D: MoshDisplay> MoshSession<D> {
     /// the `MOSH CONNECT` key. The embedder owns `display` (the same
     /// Arc the session drives) and reads frames from it. Events fire
     /// on the loop thread.
+    #[allow(clippy::too_many_arguments)]
     pub fn connect<F>(
         display: Arc<Mutex<D>>,
         addr: &str,
@@ -354,6 +355,7 @@ impl<D: MoshDisplay> MoshSession<D> {
     /// loop stays UNSTARTED — the async constructor must return before
     /// any thread exists (see `launch`). `MoshClient::activate` starts
     /// it from a safe, synchronous FFI context.
+    #[allow(clippy::too_many_arguments)]
     pub fn connect_deferred<F>(
         display: Arc<Mutex<D>>,
         addr: &str,

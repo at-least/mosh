@@ -49,36 +49,42 @@ struct ServerHandles {
 /// A capture display: records fed bytes + resizes at a fixed size.
 #[derive(Clone, Default)]
 struct TestDisplay {
-    state: Arc<Mutex<(Vec<u8>, Vec<(usize, usize)>)>>,
+    state: Arc<Mutex<TestState>>,
     cols: usize,
     rows: usize,
+}
+
+#[derive(Clone, Default)]
+struct TestState {
+    fed: Vec<u8>,
+    resizes: Vec<(usize, usize)>,
 }
 impl TestDisplay {
     fn new(cols: usize, rows: usize) -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(TestDisplay {
-            state: Arc::new(Mutex::new((Vec::new(), Vec::new()))),
+            state: Arc::new(Mutex::new(TestState::default())),
             cols,
             rows,
         }))
     }
-    fn snapshot(&self) -> (Vec<u8>, Vec<(usize, usize)>) {
+    fn snapshot(&self) -> TestState {
         self.state.lock().unwrap().clone()
     }
 }
 impl MoshDisplay for TestDisplay {
     fn new_blank(cols: usize, rows: usize) -> Self {
         TestDisplay {
-            state: Arc::new(Mutex::new((Vec::new(), Vec::new()))),
+            state: Arc::new(Mutex::new(TestState::default())),
             cols,
             rows,
         }
     }
     fn feed(&mut self, bytes: &[u8]) {
-        self.state.lock().unwrap().0.extend_from_slice(bytes);
+        self.state.lock().unwrap().fed.extend_from_slice(bytes);
     }
     fn resize(&mut self, cols: usize, rows: usize) {
         self.cols = cols;
-        self.state.lock().unwrap().1.push((cols, rows));
+        self.state.lock().unwrap().resizes.push((cols, rows));
     }
     fn cols(&self) -> usize {
         self.cols
@@ -247,7 +253,7 @@ fn wait_until(deadline_ms: u64, check: impl Fn() -> bool) -> bool {
 
 /// The display's fed bytes as text (the loopback marker assertions).
 fn fed_text(display: &Arc<Mutex<TestDisplay>>) -> String {
-    String::from_utf8_lossy(&display.lock().unwrap().snapshot().0).into_owned()
+    String::from_utf8_lossy(&display.lock().unwrap().snapshot().fed).into_owned()
 }
 
 #[test]
@@ -305,7 +311,7 @@ fn udp_loopback_input_hostbytes_and_clean_shutdown() {
     });
     assert!(
         wait_until(3000, || {
-            display.lock().unwrap().snapshot().1.contains(&(100, 30))
+            display.lock().unwrap().snapshot().resizes.contains(&(100, 30))
         }),
         "the host resize must reach the display"
     );
