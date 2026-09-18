@@ -501,6 +501,58 @@ fn torn_fragments_refresh_heard_but_not_the_connecting_flag() {
     client.terminate();
 }
 
+/// P6 regression: the server's echo-ack retires predictions on EVERY
+/// appended state — an echoack-only instruction (no host bytes) is
+/// enough upstream (completeterminal.cc:130-160); the guesses must not
+/// linger until the next paint.
+#[test]
+fn echoack_only_state_retires_predictions() {
+    let key = Base64Key::parse("7l1cNvxYVkWP1j8zMC08Jg").unwrap();
+    let server = spawn_test_server(key.clone());
+
+    let client = MoshSession::connect(
+        TestDisplay::new(20, 4),
+        "127.0.0.1",
+        server.addr.port(),
+        &key,
+        |_| {},
+        20,
+        4,
+        true, // prediction ON
+    )
+    .expect("connect");
+
+    // associate, then silence so only predictions can paint
+    client.send_input(b"x");
+    assert!(
+        wait_until(3000, || !client.link_health().never_heard),
+        "associate first"
+    );
+    server.go_silent.store(true, Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(300));
+
+    client.send_input(b"hi");
+    assert!(
+        wait_until(1000, || !client.prediction_overlay().is_empty()),
+        "predictions must appear first"
+    );
+
+    // the server answers with an ECHOACK ONLY — no host bytes, no paint
+    server.go_silent.store(false, Ordering::Relaxed);
+    server
+        .outbox
+        .lock()
+        .unwrap()
+        .push(HostInstruction::EchoAck(99));
+    assert!(
+        wait_until(4000, || client.prediction_overlay().is_empty()),
+        "an echoack-only state must retire the guesses, got {:?}",
+        client.prediction_overlay()
+    );
+    server.stop.store(true, Ordering::Relaxed);
+    client.terminate();
+}
+
 /// Conservative local echo (the S5b layer): against a SILENT server,
 /// typed printables appear on the core display at once (underlined —
 /// the "this is a guess" mark); when the server finally paints and its

@@ -130,16 +130,14 @@ struct Endpoint<S: SspSentState, R: SspReceivedState> {
 impl<S: SspSentState, R: SspReceivedState> Endpoint<S, R> {
     fn tick_into(&mut self, now: u64, from_client: bool, channel: &mut Channel) {
         let mut frags = Vec::new();
-        self.sender
-            .tick(
-                now,
-                RTO,
-                SEND_INTERVAL,
-                MTU,
-                &mut self.fragmenter,
-                &mut frags,
-            )
-            .expect("tick");
+        self.sender.tick(
+            now,
+            RTO,
+            SEND_INTERVAL,
+            MTU,
+            &mut self.fragmenter,
+            &mut frags,
+        );
         for frag in &frags {
             channel.send(from_client, frag, now);
         }

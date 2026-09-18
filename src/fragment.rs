@@ -426,7 +426,9 @@ mod tests {
         let mut fragmenter = Fragmenter::default();
         let inst = sample_instruction(b"payload", 1);
         assert_eq!(
-            fragmenter.make_fragments(&inst, FRAG_HEADER_LEN - 1).unwrap_err(),
+            fragmenter
+                .make_fragments(&inst, FRAG_HEADER_LEN - 1)
+                .unwrap_err(),
             FragmentError::MtuTooSmall
         );
     }

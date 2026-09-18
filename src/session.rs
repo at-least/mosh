@@ -746,24 +746,14 @@ impl<D: MoshDisplay> SessionLoop<D> {
             }
 
             let mut out = Vec::new();
-            if self
-                .sender
-                .tick(
-                    now,
-                    self.rto(),
-                    self.send_interval(),
-                    self.fragment_mtu(),
-                    &mut self.fragmenter,
-                    &mut out,
-                )
-                .is_err()
-            {
-                (self.events)(SessionEvent::Ended {
-                    clean: false,
-                    error: Some("mosh: peer speaks an incompatible protocol".into()),
-                });
-                break;
-            }
+            self.sender.tick(
+                now,
+                self.rto(),
+                self.send_interval(),
+                self.fragment_mtu(),
+                &mut self.fragmenter,
+                &mut out,
+            );
             for fragment in &out {
                 self.send_fragment(fragment);
             }
@@ -948,6 +938,10 @@ impl<D: MoshDisplay> SessionLoop<D> {
                 // upstream "still connecting" means no appended remote
                 // state yet (stmclient.h:81-85) — an appended state ends it
                 self.shared.never_heard.store(false, Ordering::Relaxed);
+                // the server's echo-ack retires guesses on EVERY appended
+                // state, echoack-only ones included (completeterminal.cc)
+                let echo_ack = self.receiver.latest_state().echo_ack;
+                self.retire_predictions(echo_ack);
                 // advance the engine along the newest state's log: the
                 // common case is a pure suffix (feed it); a state that
                 // branched from an older base means the diff was a
@@ -963,7 +957,6 @@ impl<D: MoshDisplay> SessionLoop<D> {
                         }
                         drop(display);
                         self.engine_at = latest.log.clone();
-                        self.retire_predictions(latest.echo_ack);
                         self.shared.frame_version.fetch_add(1, Ordering::Relaxed);
                         (self.events)(SessionEvent::ScreenChanged { host_num: num });
                     }

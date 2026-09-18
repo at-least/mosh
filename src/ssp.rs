@@ -543,7 +543,10 @@ impl<S: SspSentState> SspSender<S> {
 
     /// mosh's `tick`: send a diff or an empty ack if one is due. Due
     /// fragments are appended to `out` (already sliced and identified —
-    /// hand them to the crypto layer one datagram each).
+    /// hand them to the crypto layer one datagram each). Infallible, like
+    /// upstream's void tick: protocol-version and diff errors belong to
+    /// the receive path, and a session-sized MTU cannot fail the
+    /// fragmenter.
     pub fn tick(
         &mut self,
         now: u64,
@@ -552,7 +555,7 @@ impl<S: SspSentState> SspSender<S> {
         mtu: usize,
         fragmenter: &mut Fragmenter,
         out: &mut Vec<Fragment>,
-    ) -> Result<(), SspError> {
+    ) {
         self.update_assumed_receiver_state(now, rto);
         self.rationalize_states();
         let (next_send, next_ack) = self.compute_timers(now, rto, send_interval);
@@ -560,7 +563,7 @@ impl<S: SspSentState> SspSender<S> {
         let due_send = next_send.is_some_and(|t| now >= t);
         let due_ack = next_ack.is_some_and(|t| now >= t);
         if !due_send && !due_ack {
-            return Ok(());
+            return;
         }
 
         let mut diff = self
@@ -581,7 +584,6 @@ impl<S: SspSentState> SspSender<S> {
             self.send_to_receiver(now, &diff, mtu, fragmenter, out);
             self.mindelay_clock = None;
         }
-        Ok(())
     }
 
     fn attempt_prospective_resend_optimization(&mut self, proposed_diff: &mut Vec<u8>) {
@@ -906,9 +908,7 @@ mod tests {
 
         let mut fragmenter = Fragmenter::default();
         let mut out = Vec::new();
-        sender
-            .tick(101, 120, 20, 1200, &mut fragmenter, &mut out)
-            .unwrap();
+        sender.tick(101, 120, 20, 1200, &mut fragmenter, &mut out);
         assert!(!out.is_empty(), "the delayed ack went out at t=101");
         // an empty-ack still advances the state number
         let frag = Fragment::parse(&out[0].tostring()).unwrap();
@@ -930,20 +930,14 @@ mod tests {
         let mut fragmenter = Fragmenter::default();
         let mut out = Vec::new();
         for t in 0..15u64 {
-            sender
-                .tick(t, 120, 20, 1200, &mut fragmenter, &mut out)
-                .unwrap();
+            sender.tick(t, 120, 20, 1200, &mut fragmenter, &mut out);
         }
         sender.current_state().push_bytes(b"a");
         for t in 15..23u64 {
-            sender
-                .tick(t, 120, 20, 1200, &mut fragmenter, &mut out)
-                .unwrap();
+            sender.tick(t, 120, 20, 1200, &mut fragmenter, &mut out);
         }
         assert!(out.is_empty(), "held past the interval bound (t=20..22)");
-        sender
-            .tick(23, 120, 20, 1200, &mut fragmenter, &mut out)
-            .unwrap();
+        sender.tick(23, 120, 20, 1200, &mut fragmenter, &mut out);
         assert!(!out.is_empty(), "send goes out at the mindelay bound");
     }
 
@@ -1035,9 +1029,7 @@ mod tests {
                 .push_bytes(format!("k{i:02},").as_bytes());
             loop {
                 let mut out = Vec::new();
-                sender
-                    .tick(now, rto, 20, 1200, &mut fragmenter, &mut out)
-                    .unwrap();
+                sender.tick(now, rto, 20, 1200, &mut fragmenter, &mut out);
                 for frag in &out {
                     let Some(inst) =
                         assembly.add_fragment(Fragment::parse(&frag.tostring()).unwrap())
