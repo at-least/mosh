@@ -603,10 +603,14 @@ impl<S: SspSentState> SspSender<S> {
             // known-receiver head and the newest 15 states survive
             let idx = self.sent_states.len() - 16;
             self.sent_states.remove(idx);
-            if self.assumed_receiver >= idx {
-                // the assumption just lost its target: fall back to the
-                // known-receiver head rather than silently pointing at a
-                // newer state the peer may not have
+            // keep the index pointing at the SAME state, like mosh's
+            // list iterator, which survives erasing another element
+            if self.assumed_receiver > idx {
+                self.assumed_receiver -= 1;
+            } else if self.assumed_receiver == idx {
+                // the assumed state itself was culled — unreachable while
+                // assumed is only ever the known-receiver head (0) or the
+                // newest (len-1); fall back to the head
                 self.assumed_receiver = 0;
             }
         }
@@ -625,8 +629,11 @@ impl<S: SspSentState> SspSender<S> {
             self.sent_states.back().unwrap().num + 1
         };
         let state = self.current_state.clone();
+        // the diff (here: empty) pairs with the pre-cull assumed state —
+        // capture its num before add_sent_state may shift the indices
+        let old_num = self.sent_states[self.assumed_receiver].num;
         self.add_sent_state(now, new_num, state);
-        self.send_in_fragments(b"", new_num, mtu, fragmenter, out);
+        self.send_in_fragments(b"", old_num, new_num, mtu, fragmenter, out);
         self.next_ack_time = now + ACK_INTERVAL_MS;
         self.next_send_time = None;
     }
@@ -647,13 +654,17 @@ impl<S: SspSentState> SspSender<S> {
         if self.shutdown_in_progress {
             new_num = SHUTDOWN_NUM;
         }
+        // the diff was computed against the assumed state; capture its
+        // num before add_sent_state may cull and shift the indices, so
+        // old_num on the wire always names the diff's base
+        let old_num = self.sent_states[self.assumed_receiver].num;
         if new_num == self.sent_states.back().unwrap().num {
             self.sent_states.back_mut().unwrap().timestamp = now;
         } else {
             let state = self.current_state.clone();
             self.add_sent_state(now, new_num, state);
         }
-        self.send_in_fragments(diff, new_num, mtu, fragmenter, out);
+        self.send_in_fragments(diff, old_num, new_num, mtu, fragmenter, out);
         self.assumed_receiver = self.sent_states.len() - 1;
         self.next_ack_time = now + ACK_INTERVAL_MS;
         self.next_send_time = None;
@@ -662,6 +673,7 @@ impl<S: SspSentState> SspSender<S> {
     fn send_in_fragments(
         &mut self,
         diff: &[u8],
+        old_num: u64,
         new_num: u64,
         mtu: usize,
         fragmenter: &mut Fragmenter,
@@ -669,7 +681,7 @@ impl<S: SspSentState> SspSender<S> {
     ) {
         let inst = TransportInstruction {
             protocol_version: MOSH_PROTOCOL_VERSION,
-            old_num: self.sent_states[self.assumed_receiver].num,
+            old_num,
             new_num,
             ack_num: self.ack_num,
             throwaway_num: self.sent_states.front().unwrap().num,
@@ -993,6 +1005,76 @@ mod tests {
         ));
         assert_eq!(rx.latest().num, 3, "3 stays newest");
         assert_eq!(rx.state_count(), 4);
+    }
+
+    /// B2 regression: past the 32-entry sent-state cap, every emitted
+    /// instruction must stay COHERENT — applying its diff to the receiver
+    /// state named by `old_num` must reproduce the sender's current
+    /// state. The cull used to reset the assumed-receiver index before
+    /// `old_num` was read, pairing a tail diff with a front `old_num`
+    /// (silently forking the peer's copy of the stream).
+    #[test]
+    fn instructions_stay_coherent_past_32_unacked_states() {
+        let rto = 1000; // in-spec clamp top; freshness window = rto + ACK_DELAY
+        let mut sender: SspSender<UserStream> = SspSender::new(UserStream::new(), 0, 1);
+        let mut receiver: SspReceiver<UserStream> = SspReceiver::new(UserStream::new(), 0);
+        let mut fragmenter = Fragmenter::default();
+        let mut assembly = FragmentAssembly::new();
+        let mut now: u64 = 0;
+        let mut instructions_checked = 0;
+
+        for i in 0..50u64 {
+            sender
+                .current_state()
+                .push_bytes(format!("k{i:02},").as_bytes());
+            loop {
+                let mut out = Vec::new();
+                sender
+                    .tick(now, rto, 20, 1200, &mut fragmenter, &mut out)
+                    .unwrap();
+                for frag in &out {
+                    let Some(inst) =
+                        assembly.add_fragment(Fragment::parse(&frag.tostring()).unwrap())
+                    else {
+                        continue;
+                    };
+                    // coherence: old_num must NAME the state the diff
+                    // was computed against
+                    let named = receiver
+                        .received
+                        .iter()
+                        .find(|s| s.num == inst.old_num)
+                        .unwrap_or_else(|| {
+                            panic!("instruction names unheld state {}", inst.old_num)
+                        })
+                        .clone();
+                    let mut expected = named.state.clone();
+                    if !inst.diff.is_empty() {
+                        expected.apply_string(&inst.diff).unwrap();
+                    }
+                    assert_eq!(
+                        expected,
+                        *sender.current_state(),
+                        "incoherent instruction old={} new={} diff_len={} at t={now}",
+                        inst.old_num,
+                        inst.new_num,
+                        inst.diff.len()
+                    );
+                    receiver.process_instruction(&inst, now).unwrap();
+                    instructions_checked += 1;
+                }
+                if !out.is_empty() {
+                    break;
+                }
+                now += 1;
+            }
+            now += 1;
+        }
+        // the queue was saturated on the way (the bug needs >32 states)
+        assert_eq!(sender.sent_states.len(), SENT_QUEUE_CAP);
+        // and the peer reconstructed the full stream
+        assert_eq!(receiver.latest_state().len(), sender.current_state().len());
+        assert!(instructions_checked >= 40, "checked {instructions_checked}");
     }
 
     #[test]
