@@ -34,6 +34,8 @@ pub enum FragmentError {
     AssemblyTooLarge,
     #[error("fragment index beyond the 15-bit wire limit")]
     IndexTooLarge,
+    #[error("fragment budget smaller than the 10-byte header")]
+    MtuTooSmall,
     #[error("compressed stream failed to inflate: {0}")]
     Inflate(String),
     #[error("inflated instruction failed to parse: {0}")]
@@ -123,6 +125,9 @@ impl Fragmenter {
         mut mtu: usize,
     ) -> Result<Vec<Fragment>, FragmentError> {
         mtu = mtu.saturating_sub(FRAG_HEADER_LEN);
+        if mtu == 0 {
+            return Err(FragmentError::MtuTooSmall);
+        }
 
         let header = (
             inst.protocol_version,
@@ -411,5 +416,18 @@ mod tests {
         assert!(frag.final_);
         assert_eq!(frag.fragment_num, 1);
         assert_eq!(frag.contents, vec![0xAA]);
+    }
+
+    /// A fragment budget that cannot even hold the 10-byte header is a
+    /// caller bug: refuse it up front instead of emitting 32k empty
+    /// fragments before tripping the index limit.
+    #[test]
+    fn mtu_smaller_than_the_header_is_refused() {
+        let mut fragmenter = Fragmenter::default();
+        let inst = sample_instruction(b"payload", 1);
+        assert_eq!(
+            fragmenter.make_fragments(&inst, FRAG_HEADER_LEN - 1).unwrap_err(),
+            FragmentError::MtuTooSmall
+        );
     }
 }
