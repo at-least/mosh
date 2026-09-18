@@ -458,6 +458,12 @@ impl<S: SspSentState> SspSender<S> {
         self.last_heard = ts;
     }
 
+    /// When the peer last appended a state we hold (introspection).
+    #[doc(hidden)]
+    pub fn last_heard(&self) -> u64 {
+        self.last_heard
+    }
+
     fn update_assumed_receiver_state(&mut self, now: u64, rto: u64) {
         self.assumed_receiver = 0;
         for i in 1..self.sent_states.len() {

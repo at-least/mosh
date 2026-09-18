@@ -26,7 +26,7 @@ use super::crypto::{Base64Key, Direction, MoshOpener, MoshSealer, PacketHeader};
 use super::fragment::{Fragment, FragmentAssembly, Fragmenter};
 use super::ssp::{
     send_interval_ms, EventLog, HostEvent, HostStreamState, RecvOutcome, SspReceiver, SspSender,
-    UserStream,
+    SspSentState, UserStream,
 };
 
 /// mosh's port-hop interval (network.h PORT_HOP_INTERVAL).
@@ -578,6 +578,30 @@ fn is_emsgsize(e: &std::io::Error) -> bool {
 
 // --- the loop ------------------------------------------------------------
 
+/// The receive-side sender updates (upstream networktransport-impl.h
+/// `recv()`): what each receiver outcome does to OUR outbound sender.
+fn apply_recv_outcome<Sent: SspSentState, Recv>(
+    sender: &mut SspSender<Sent>,
+    outcome: RecvOutcome<Recv>,
+    now: u64,
+) {
+    match outcome {
+        RecvOutcome::Latest { num, had_diff, .. } => {
+            sender.set_ack_num(num);
+            sender.remote_heard(now);
+            if had_diff {
+                sender.set_data_ack();
+            }
+        }
+        RecvOutcome::OutOfOrder { .. } => {
+            // upstream returns right after inserting (networktransport-
+            // impl.h:143-165): an out-of-order state never refreshes the
+            // retry window, raises our ack, or schedules a data ack
+        }
+        RecvOutcome::Duplicate | RecvOutcome::NoReference | RecvOutcome::Quenched => {}
+    }
+}
+
 struct SessionLoop<D: MoshDisplay> {
     socks: Vec<UdpSocket>, // newest last
     target: SocketAddr,
@@ -869,6 +893,9 @@ impl<D: MoshDisplay> SessionLoop<D> {
         let seq_ok = seq >= self.expected_receiver_seq;
         if seq_ok {
             self.expected_receiver_seq = seq + 1;
+            // any fresh-seq datagram is proof of life, whether or not
+            // its fragment assembles (network.cc:556)
+            self.shared.last_heard_ms.store(now, Ordering::Relaxed);
             if header.timestamp != u16::MAX {
                 self.saved_timestamp = Some((header.timestamp, now));
             }
@@ -903,8 +930,6 @@ impl<D: MoshDisplay> SessionLoop<D> {
         self.shared
             .last_roundtrip_ms
             .store(self.last_roundtrip_success, Ordering::Relaxed);
-        self.shared.last_heard_ms.store(now, Ordering::Relaxed);
-        self.shared.never_heard.store(false, Ordering::Relaxed);
 
         let trace = std::env::var_os("MOSH_TRACE").is_some();
         if trace {
@@ -918,12 +943,11 @@ impl<D: MoshDisplay> SessionLoop<D> {
             );
         }
         match self.receiver.process_instruction(&inst, now) {
-            Ok(RecvOutcome::Latest { num, had_diff, .. }) => {
-                self.sender.set_ack_num(num);
-                self.sender.remote_heard(now);
-                if had_diff {
-                    self.sender.set_data_ack();
-                }
+            Ok(outcome @ RecvOutcome::Latest { num, .. }) => {
+                apply_recv_outcome(&mut self.sender, outcome, now);
+                // upstream "still connecting" means no appended remote
+                // state yet (stmclient.h:81-85) — an appended state ends it
+                self.shared.never_heard.store(false, Ordering::Relaxed);
                 // advance the engine along the newest state's log: the
                 // common case is a pure suffix (feed it); a state that
                 // branched from an older base means the diff was a
@@ -967,11 +991,11 @@ impl<D: MoshDisplay> SessionLoop<D> {
                     (self.events)(SessionEvent::ScreenChanged { host_num: num });
                 }
             }
-            Ok(RecvOutcome::OutOfOrder { .. }) => {
+            Ok(outcome @ RecvOutcome::OutOfOrder { .. }) => {
                 if trace {
                     eprintln!("[mosh]   -> out-of-order insert");
                 }
-                self.sender.remote_heard(now);
+                apply_recv_outcome(&mut self.sender, outcome, now);
             }
             Ok(other) => {
                 if trace {
@@ -1064,5 +1088,50 @@ impl<D: MoshDisplay> SessionLoop<D> {
         while self.socks.len() > MAX_PORTS_OPEN {
             self.socks.remove(0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// B1 regression: an out-of-order insert must NOT refresh the
+    /// sender's retry window. Upstream returns from `recv()` right
+    /// after inserting (networktransport-impl.h:143-165), before
+    /// `remote_heard` (line 162) — only an appended state counts as
+    /// heard. Refreshing on out-of-order keeps frame-rate resends
+    /// alive longer than stock mosh would.
+    #[test]
+    fn out_of_order_insert_does_not_refresh_the_resend_window() {
+        let mut sender: SspSender<UserStream> = SspSender::new(UserStream::new(), 0, 1);
+        apply_recv_outcome(
+            &mut sender,
+            RecvOutcome::<UserStream>::OutOfOrder {
+                num: 1,
+                had_diff: true,
+            },
+            1234,
+        );
+        assert_eq!(
+            sender.last_heard(),
+            0,
+            "out-of-order must not count as heard"
+        );
+    }
+
+    /// Guard for the deletion above: the appended path still refreshes.
+    #[test]
+    fn latest_append_refreshes_the_resend_window() {
+        let mut sender: SspSender<UserStream> = SspSender::new(UserStream::new(), 0, 1);
+        apply_recv_outcome(
+            &mut sender,
+            RecvOutcome::Latest {
+                num: 5,
+                had_diff: true,
+                state: UserStream::new(),
+            },
+            777,
+        );
+        assert_eq!(sender.last_heard(), 777);
     }
 }

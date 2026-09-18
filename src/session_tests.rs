@@ -219,7 +219,9 @@ fn spawn_test_server(key: Base64Key) -> ServerHandles {
                                         }
                                     }
                                     Ok(RecvOutcome::OutOfOrder { .. }) => {
-                                        sender.remote_heard(t);
+                                        // out-of-order inserts never refresh
+                                        // the retry window (upstream returns
+                                        // right after inserting)
                                     }
                                     _ => {}
                                 }
@@ -395,6 +397,108 @@ fn terminate_stops_the_loop_without_handshake() {
     .expect("connect");
     client.terminate(); // must return promptly, no hang
     server.stop.store(true, Ordering::Relaxed);
+}
+
+/// B4 regression: upstream refreshes `last_heard` on every packet that
+/// decrypts with a fresh sequence number (network.cc:556), whether or
+/// not its fragment assembles into an instruction — a stream of torn
+/// fragments is still proof the link is alive. But `still_connecting`
+/// upstream means "no appended remote state yet", so the connecting
+/// flag must NOT clear on torn fragments alone.
+#[test]
+fn torn_fragments_refresh_heard_but_not_the_connecting_flag() {
+    let key = Base64Key::parse("7l1cNvxYVkWP1j8zMC08Jg").unwrap();
+    let socket = UdpSocket::bind(("127.0.0.1", 0)).expect("bind");
+    let server_addr = socket.local_addr().expect("addr");
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_move = Arc::clone(&stop);
+
+    // one instruction, deliberately incompressible so it fragments
+    let mut mix: u64 = 0x243F_6A88_85A3_08D3;
+    let big_diff: Vec<u8> = (0..3000)
+        .map(|_| {
+            mix = mix
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (mix >> 56) as u8
+        })
+        .collect();
+    let inst = super::wire::TransportInstruction {
+        protocol_version: 2,
+        old_num: 0,
+        new_num: 1,
+        ack_num: 0,
+        throwaway_num: 0,
+        diff: big_diff,
+        chaff: Vec::new(),
+    };
+    let mut fragmenter = Fragmenter::default();
+    let mut frags = fragmenter
+        .make_fragments(&inst, 1200 - 12 - 16)
+        .expect("fragments");
+    assert!(
+        frags.len() >= 2,
+        "instruction must split so we can send a torn piece"
+    );
+    let torn = frags.remove(0); // fragment 0, final=false — never assembles
+
+    let thread_key = key.clone();
+    std::thread::spawn(move || {
+        let mut sealer = MoshSealer::new(&thread_key, Direction::ToClient);
+        let mut buf = [0u8; 2048];
+        socket
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .ok();
+        let mut peer: Option<std::net::SocketAddr> = None;
+        loop {
+            if stop_move.load(Ordering::Relaxed) {
+                return;
+            }
+            // adopt the client as peer whenever it talks to us
+            if let Ok((_, src)) = socket.recv_from(&mut buf) {
+                peer = Some(src);
+            }
+            if let Some(client_addr) = peer {
+                let header = PacketHeader {
+                    timestamp: 0,
+                    timestamp_reply: u16::MAX,
+                };
+                if let Ok(datagram) = sealer.seal(&header, &torn.tostring()) {
+                    let _ = socket.send_to(&datagram, client_addr);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
+
+    let display = TestDisplay::new(80, 24);
+    let client = MoshSession::connect(
+        display,
+        "127.0.0.1",
+        server_addr.port(),
+        &key,
+        |_| {},
+        80,
+        24,
+        false,
+    )
+    .expect("connect");
+
+    // let the torn fragments flow for a while: if they refresh "heard",
+    // the metric stays small; if not, it grows with the clock
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        client.link_health().since_heard_ms < 250,
+        "every decrypted datagram must refresh last_heard, got since_heard_ms={}",
+        client.link_health().since_heard_ms
+    );
+    // ... but no instruction ever completed, so we are still connecting
+    assert!(
+        client.link_health().never_heard,
+        "the connecting flag must not clear without an appended state"
+    );
+    stop.store(true, Ordering::Relaxed);
+    client.terminate();
 }
 
 /// Conservative local echo (the S5b layer): against a SILENT server,
