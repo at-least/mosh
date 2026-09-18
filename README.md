@@ -43,8 +43,9 @@ echo-ack) is built in and on by default; toggle with
 
 ## Server requirements
 
-`mosh-server` ≥ 1.4 (the byte-stream model; the client checks
-`protocol_version`), UDP ports 60000–61000 reachable.
+`mosh-server` 1.3.2 or newer (the byte-stream model and the three proto
+schemas are unchanged since then; the client checks `protocol_version`
+= 2 and is tested against 1.4.0), UDP ports 60000–61000 reachable.
 
 ## Oracles
 

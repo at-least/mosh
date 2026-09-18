@@ -151,7 +151,7 @@ bytes   contents        -- a slice of the zlib-compressed Instruction
   1280 − (20+8) for IPv4 / 1280 − (40+16+8) for IPv6 (network.h:108-131),
   minus the 10-byte fragment header inside `make_fragments`. A datagram
   that hits EMSGSIZE drops the connection MTU to 500 (network.cc:412-414).
-- **Framing** (make_fragments, transportfragment.cc:157-199): the
+- **Framing** (make_fragments, transportfragment.cc:157-195): the
   serialized `Instruction` is zlib-compressed whole (`compress()`:
   zlib header + adler32, default level — flate2 `ZlibEncoder` equivalent),
   then sliced into ≤MTU fragments; the last carries the final bit.
@@ -349,6 +349,21 @@ message EchoAck     { optional uint64 echo_ack_num = 8; }
   legal (pure retransmit marker).
 - **u64::MAX = 0xFFFF…FF** is reserved as the shutdown new_num; real
   state numbers never reach it.
+- **More error-not-abort hardening** (same stance as the items above,
+  all invisible to well-formed peers):
+  - *Hostile throwaway*: a `throwaway_num` that would empty the
+    receiver's state queue is refused and the instruction dropped
+    (`process_throwaway_until`); stock `fatal_assert`s and aborts
+    (networktransport-impl.h:183).
+  - *Oversize datagrams*: anything past the 2048-byte receive buffer
+    is truncated and then fails the tag — dropped. Stock surfaces a
+    NetworkException banner in the UI and continues
+    (stmclient.cc:558-567); neither side ends the session.
+  - *echo_ack regression*: a non-monotonic `echo_ack_num` is clamped
+    (`max`) where upstream asserts (completeterminal.cc:118).
+  - *Fragment-count inconsistency*: a final fragment naming fewer
+    fragments than already received truncates and recounts; stock
+    asserts (transportfragment.cc add_fragment).
 
 ## 10. Golden transcript
 
