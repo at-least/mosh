@@ -311,7 +311,12 @@ fn udp_loopback_input_hostbytes_and_clean_shutdown() {
     });
     assert!(
         wait_until(3000, || {
-            display.lock().unwrap().snapshot().resizes.contains(&(100, 30))
+            display
+                .lock()
+                .unwrap()
+                .snapshot()
+                .resizes
+                .contains(&(100, 30))
         }),
         "the host resize must reach the display"
     );

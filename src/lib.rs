@@ -33,7 +33,10 @@ mod session_tests;
 pub mod ssp;
 pub mod wire;
 
-pub use bootstrap::{mosh_server_command, parse_mosh_bootstrap, MoshBootstrap, MoshBootstrapError};
+pub use bootstrap::{
+    mosh_server_command, mosh_tmux_payload_args, parse_mosh_bootstrap, MoshBootstrap,
+    MoshBootstrapError,
+};
 pub use crypto::{
     Base64Key, Direction, MoshCryptoError, MoshOpener, MoshSealer, Nonce, PacketHeader,
 };
