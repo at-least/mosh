@@ -938,16 +938,13 @@ impl<D: MoshDisplay> SessionLoop<D> {
                 // upstream "still connecting" means no appended remote
                 // state yet (stmclient.h:81-85) — an appended state ends it
                 self.shared.never_heard.store(false, Ordering::Relaxed);
-                // the server's echo-ack retires guesses on EVERY appended
-                // state, echoack-only ones included (completeterminal.cc)
-                let echo_ack = self.receiver.latest_state().echo_ack;
-                self.retire_predictions(echo_ack);
                 // advance the engine along the newest state's log: the
                 // common case is a pure suffix (feed it); a state that
                 // branched from an older base means the diff was a
                 // repaint against a different screen — rebuild the
                 // engine from the state's full log
                 let latest = self.receiver.latest_state();
+                let mut fed = false;
                 if let Some(suffix) = latest.log.suffix_over(&self.engine_at) {
                     if !suffix.is_empty() {
                         let trace = std::env::var_os("MOSH_TRACE").is_some();
@@ -957,8 +954,7 @@ impl<D: MoshDisplay> SessionLoop<D> {
                         }
                         drop(display);
                         self.engine_at = latest.log.clone();
-                        self.shared.frame_version.fetch_add(1, Ordering::Relaxed);
-                        (self.events)(SessionEvent::ScreenChanged { host_num: num });
+                        fed = true;
                     }
                     // Some(empty): the engine already sits exactly here
                 } else {
@@ -980,6 +976,16 @@ impl<D: MoshDisplay> SessionLoop<D> {
                     }
                     *self.display.lock().unwrap() = fresh;
                     self.engine_at = latest.log.clone();
+                    fed = true;
+                }
+                // retire AFTER the real bytes landed: a render in between
+                // then still shows the guess alongside reality, never an
+                // empty slot where the guess used to be. An echoack-only
+                // state (nothing fed) retires here too — upstream's
+                // echo-ack never waits for the next paint — and that alone
+                // is a repaint trigger, or the stale underline lingers.
+                let echo_ack = self.receiver.latest_state().echo_ack;
+                if self.retire_predictions(echo_ack) || fed {
                     self.shared.frame_version.fetch_add(1, Ordering::Relaxed);
                     (self.events)(SessionEvent::ScreenChanged { host_num: num });
                 }
@@ -1033,8 +1039,10 @@ impl<D: MoshDisplay> SessionLoop<D> {
 
     /// The server echoed everything typed up to `echo_ack` (spec §7.2)
     /// — those guesses are now reality, the real bytes already
-    /// rendered. Retire the oldest confirmed cells.
-    fn retire_predictions(&mut self, echo_ack: u64) {
+    /// rendered. Retire the oldest confirmed cells. Returns true when
+    /// any cell was drained, i.e. the display must repaint to drop the
+    /// guess underline.
+    fn retire_predictions(&mut self, echo_ack: u64) -> bool {
         if std::env::var_os("MOSH_TRACE").is_some() {
             eprintln!(
                 "[mosh] retire: echo_ack={echo_ack} frames={:?} cells={}",
@@ -1056,7 +1064,9 @@ impl<D: MoshDisplay> SessionLoop<D> {
             let mut prediction = self.prediction.lock().unwrap();
             let take = (confirmed as usize).min(prediction.cells.len());
             prediction.cells.drain(..take);
+            return take > 0;
         }
+        false
     }
 
     fn maybe_hop_port(&mut self, now: u64) {

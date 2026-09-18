@@ -536,6 +536,7 @@ fn echoack_only_state_retires_predictions() {
         wait_until(1000, || !client.prediction_overlay().is_empty()),
         "predictions must appear first"
     );
+    let frames_before = client.frame_version();
 
     // the server answers with an ECHOACK ONLY — no host bytes, no paint
     server.go_silent.store(false, Ordering::Relaxed);
@@ -548,6 +549,14 @@ fn echoack_only_state_retires_predictions() {
         wait_until(4000, || client.prediction_overlay().is_empty()),
         "an echoack-only state must retire the guesses, got {:?}",
         client.prediction_overlay()
+    );
+    // retiring cells changes what the embedder must draw: the frame
+    // version must move (and ScreenChanged fire) or the stale
+    // underline lingers until something else repaints
+    assert!(
+        wait_until(2000, || client.frame_version() > frames_before),
+        "the retirement must signal the embedder (frame_version {} stayed at {frames_before})",
+        client.frame_version()
     );
     server.stop.store(true, Ordering::Relaxed);
     client.terminate();

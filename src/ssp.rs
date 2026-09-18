@@ -545,8 +545,9 @@ impl<S: SspSentState> SspSender<S> {
     /// fragments are appended to `out` (already sliced and identified —
     /// hand them to the crypto layer one datagram each). Infallible, like
     /// upstream's void tick: protocol-version and diff errors belong to
-    /// the receive path, and a session-sized MTU cannot fail the
-    /// fragmenter.
+    /// the receive path. `mtu` must leave room for the 10-byte fragment
+    /// header — the session's floor is 472; anything smaller is a caller
+    /// bug and the instruction is dropped loudly (see send_in_fragments).
     pub fn tick(
         &mut self,
         now: u64,
@@ -700,9 +701,22 @@ impl<S: SspSentState> SspSender<S> {
         if new_num == SHUTDOWN_NUM {
             self.shutdown_tries += 1;
         }
-        if let Ok(fragments) = fragmenter.make_fragments(&inst, mtu) {
-            out.extend(fragments);
-        }
+        let fragments = match fragmenter.make_fragments(&inst, mtu) {
+            Ok(fragments) => fragments,
+            Err(e) => {
+                // unreachable from the session, whose smallest MTU (500)
+                // leaves payload budget far above the 10-byte header; a
+                // caller passing less is a bug — refuse loudly in debug
+                // builds and drop the instruction (unsent, so the data
+                // ack stays pending) rather than stall silently
+                debug_assert!(false, "make_fragments failed: {e}");
+                if std::env::var_os("MOSH_TRACE").is_some() {
+                    eprintln!("[mosh] make_fragments failed: {e}");
+                }
+                return;
+            }
+        };
+        out.extend(fragments);
         self.pending_data_ack = false;
     }
 }
@@ -1073,6 +1087,46 @@ mod tests {
         // and the peer reconstructed the full stream
         assert_eq!(receiver.latest_state().len(), sender.current_state().len());
         assert!(instructions_checked >= 40, "checked {instructions_checked}");
+
+        // shutdown accelerates empty acks to one frame while the queue
+        // stays saturated — the empty-ack capture path through the cull
+        let frozen = sender.current_state().clone();
+        sender.start_shutdown(now);
+        let mut empty_shutdown_acks = 0;
+        for _ in 0..400 {
+            now += 1;
+            let mut out = Vec::new();
+            sender.tick(now, rto, 20, 1200, &mut fragmenter, &mut out);
+            for frag in &out {
+                let Some(inst) = assembly.add_fragment(Fragment::parse(&frag.tostring()).unwrap())
+                else {
+                    continue;
+                };
+                let named = receiver
+                    .received
+                    .iter()
+                    .find(|s| s.num == inst.old_num)
+                    .unwrap_or_else(|| panic!("shutdown names unheld state {}", inst.old_num))
+                    .clone();
+                // the empty diff still names its base: the assumed state
+                assert_eq!(
+                    named.state, frozen,
+                    "incoherent shutdown instruction old={} new={}",
+                    inst.old_num, inst.new_num
+                );
+                if inst.new_num == SHUTDOWN_NUM && inst.diff.is_empty() {
+                    empty_shutdown_acks += 1;
+                }
+                receiver.process_instruction(&inst, now).unwrap();
+            }
+            if empty_shutdown_acks >= 3 {
+                break;
+            }
+        }
+        assert!(
+            empty_shutdown_acks >= 1,
+            "shutdown must drive empty acks through the saturated queue"
+        );
     }
 
     #[test]
