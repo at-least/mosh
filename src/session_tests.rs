@@ -138,7 +138,7 @@ fn spawn_test_server(key: Base64Key) -> ServerHandles {
 
             if !silent {
                 let mut frags = Vec::new();
-                let _ = sender.tick(t, 120, 20, 1200 - 12 - 16, &mut fragmenter, &mut frags);
+                sender.tick(t, 120, 20, 1200 - 12 - 16, &mut fragmenter, &mut frags);
                 if let Some(peer_addr) = peer {
                     for frag in &frags {
                         let header = PacketHeader {
@@ -185,7 +185,7 @@ fn spawn_test_server(key: Base64Key) -> ServerHandles {
                                             while Instant::now() < deadline {
                                                 let t2 = now();
                                                 let mut frags = Vec::new();
-                                                let _ = sender.tick(
+                                                sender.tick(
                                                     t2,
                                                     120,
                                                     20,
