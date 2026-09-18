@@ -1,10 +1,10 @@
 [package]
-name = "mosh"
+name = "mosh-client"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "A from-scratch, embeddable Rust client for the mosh mobile-shell protocol: AES-128-OCB3 datagrams, the SSP state-sync protocol, roaming over UDP"
-repository = "https://github.com/at-least/mosh"
+repository = "https://github.com/at-least/mosh-client"
 keywords = ["mosh", "udp", "terminal", "roaming", "ssp"]
 categories = ["network-programming"]
 
@@ -23,4 +23,4 @@ thiserror = "2"
 serde_json = "1"
 
 [lib]
-name = "mosh"
+name = "mosh_client"

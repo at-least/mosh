@@ -1,13 +1,14 @@
-# mosh (Rust)
+# mosh-client
 
 A from-scratch, embeddable Rust client for the
 [mosh](https://mosh.org/) mobile-shell protocol — UDP + AES-128-OCB3 +
 the SSP state-sync protocol — verified against stock mosh-server 1.4.0.
 
-No C++ bindings, no terminal emulator inside: the crate speaks the wire
-protocol and drives **your** display. Born inside
-[at-least/conch](https://github.com/at-least/conch); maintained here as
-a standalone library.
+This is the protocol engine of a mosh client, not upstream's whole
+`mosh-client` binary: no C++ bindings, no terminal emulator inside —
+the crate speaks the wire protocol and drives **your** display. Born
+inside [at-least/conch](https://github.com/at-least/conch); maintained
+here as a standalone library.
 
 ## Layer map
 
@@ -23,7 +24,7 @@ a standalone library.
 ## Embedding
 
 ```rust
-use mosh::{Base64Key, MoshSession, MoshDisplay};
+use mosh_client::{Base64Key, MoshSession, MoshDisplay};
 
 // 1. dial SSH yourself, exec `mosh-server new` (see bootstrap), parse
 //    the `MOSH CONNECT <port> <key>` line.

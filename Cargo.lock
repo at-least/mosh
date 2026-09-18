@@ -167,7 +167,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mosh"
+name = "mosh-client"
 version = "0.1.0"
 dependencies = [
  "aes",
