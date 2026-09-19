@@ -56,7 +56,7 @@ pub trait SspSentState: Clone + PartialEq {
     fn subtract(&mut self, known_receiver: &Self);
 }
 
-/// A state we receive and apply diffs to (client: [`HostState`]).
+/// A state we receive and apply diffs to (client: [`HostStreamState`]).
 pub trait SspReceivedState: Clone {
     fn apply_string(&mut self, diff: &[u8]) -> Result<(), WireError>;
 }

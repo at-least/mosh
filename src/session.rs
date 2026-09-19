@@ -25,9 +25,10 @@ use std::time::{Duration, Instant};
 use super::crypto::{Base64Key, Direction, MoshOpener, MoshSealer, PacketHeader};
 use super::fragment::{Fragment, FragmentAssembly, Fragmenter};
 use super::ssp::{
-    send_interval_ms, EventLog, HostEvent, HostStreamState, RecvOutcome, SspReceiver, SspSender,
-    SspSentState, UserStream,
+    send_interval_ms, EventLog, HostEvent, HostStreamState, RecvOutcome, SspError, SspReceiver,
+    SspSender, SspSentState, UserStream,
 };
+use super::wire::MOSH_PROTOCOL_VERSION;
 
 /// mosh's port-hop interval (network.h PORT_HOP_INTERVAL).
 pub const PORT_HOP_INTERVAL_MS: u64 = 10_000;
@@ -368,10 +369,10 @@ impl<D: MoshDisplay> MoshSession<D> {
         Ok(session)
     }
 
-    /// [MoshClient]'s entry: identical to [Self::connect] but the UDP
-    /// loop stays UNSTARTED — the async constructor must return before
-    /// any thread exists (see `launch`). `MoshClient::activate` starts
-    /// it from a safe, synchronous FFI context.
+    /// Like [Self::connect] but the UDP loop stays UNSTARTED — the
+    /// async constructor must return before any thread exists (see
+    /// `launch`). [Self::start] launches it from a safe, synchronous
+    /// FFI context.
     #[allow(clippy::too_many_arguments)]
     pub fn connect_deferred<F>(
         display: Arc<Mutex<D>>,
@@ -470,7 +471,7 @@ impl<D: MoshDisplay> MoshSession<D> {
     }
 
     /// Queue user bytes. The escape-key/prediction interception lives
-    /// one layer up (the MoshClient); this is the raw stream.
+    /// one layer up (the embedder); this is the raw stream.
     pub fn send_input(&self, bytes: &[u8]) {
         self.command(SessionCommand::Input(bytes.to_vec()));
     }
@@ -494,7 +495,8 @@ impl<D: MoshDisplay> MoshSession<D> {
         self.command(SessionCommand::StartShutdown);
     }
 
-    /// Hard stop (app teardown) — no handshake attempt, joins the loop.
+    /// Hard stop (app teardown) — no handshake attempt, no `Ended`
+    /// event, joins the loop.
     pub fn terminate(&self) {
         self.command(SessionCommand::Terminate);
         self.join();
@@ -649,6 +651,9 @@ struct SessionLoop<D: MoshDisplay> {
     last_roundtrip_success: u64,
     hop_interval_ms: u64,
     fatal: Option<String>,
+    /// MOSH_TRACE, read once at loop start (the old code re-queried the
+    /// environment per datagram and per prediction event)
+    trace: bool,
 }
 
 impl<D: MoshDisplay> SessionLoop<D> {
@@ -691,6 +696,7 @@ impl<D: MoshDisplay> SessionLoop<D> {
             last_roundtrip_success: 0,
             hop_interval_ms: PORT_HOP_INTERVAL_MS,
             fatal: None,
+            trace: std::env::var_os("MOSH_TRACE").is_some(),
         }
     }
 
@@ -698,10 +704,10 @@ impl<D: MoshDisplay> SessionLoop<D> {
         self.origin.elapsed().as_millis() as u64
     }
 
-    fn feed_display(&self, display: &mut D, event: &HostEvent, trace: bool) {
+    fn feed_display(&self, display: &mut D, event: &HostEvent) {
         match event {
             HostEvent::Bytes(bytes) => {
-                if trace {
+                if self.trace {
                     eprintln!(
                         "[mosh] feed {} bytes: {:?}",
                         bytes.len(),
@@ -712,7 +718,7 @@ impl<D: MoshDisplay> SessionLoop<D> {
                 self.pending_bytes.lock().unwrap().extend_from_slice(bytes);
             }
             HostEvent::Resize { width, height } => {
-                if trace {
+                if self.trace {
                     eprintln!("[mosh] host resize {width}x{height}");
                 }
                 display.resize(*width as usize, *height as usize);
@@ -942,6 +948,18 @@ impl<D: MoshDisplay> SessionLoop<D> {
             return;
         };
 
+        // the protocol-version gate precedes everything the instruction
+        // could touch (§6.2 order) — an ack from a wrong-version peer
+        // is not ours to apply. The receiver re-checks as its own
+        // invariant; the session dies either way.
+        if inst.protocol_version != MOSH_PROTOCOL_VERSION {
+            self.fatal = Some(format!(
+                "mosh: {}",
+                SspError::ProtocolVersion(inst.protocol_version)
+            ));
+            return;
+        }
+
         self.sender.process_acknowledgment_through(inst.ack_num);
         self.shared
             .user_acked
@@ -951,8 +969,7 @@ impl<D: MoshDisplay> SessionLoop<D> {
             .last_roundtrip_ms
             .store(self.last_roundtrip_success, Ordering::Relaxed);
 
-        let trace = std::env::var_os("MOSH_TRACE").is_some();
-        if trace {
+        if self.trace {
             eprintln!(
                 "[mosh] inst old={} new={} ack={} tw={} diff_len={}",
                 inst.old_num,
@@ -977,10 +994,9 @@ impl<D: MoshDisplay> SessionLoop<D> {
                 let mut fed = false;
                 if let Some(suffix) = latest.log.suffix_over(&self.engine_at) {
                     if !suffix.is_empty() {
-                        let trace = std::env::var_os("MOSH_TRACE").is_some();
                         let mut display = self.display.lock().unwrap();
                         for event in suffix {
-                            self.feed_display(&mut display, event, trace);
+                            self.feed_display(&mut display, event);
                         }
                         drop(display);
                         self.engine_at = latest.log.clone();
@@ -988,8 +1004,7 @@ impl<D: MoshDisplay> SessionLoop<D> {
                     }
                     // Some(empty): the engine already sits exactly here
                 } else {
-                    let trace = std::env::var_os("MOSH_TRACE").is_some();
-                    if trace {
+                    if self.trace {
                         eprintln!(
                             "[mosh] rebuild: state {num} branched (engine at {} of {})",
                             self.engine_at.len(),
@@ -1002,7 +1017,7 @@ impl<D: MoshDisplay> SessionLoop<D> {
                     };
                     let mut fresh = D::new_blank(cols, rows);
                     for event in latest.log.iter() {
-                        self.feed_display(&mut fresh, event, trace);
+                        self.feed_display(&mut fresh, event);
                     }
                     *self.display.lock().unwrap() = fresh;
                     self.engine_at = latest.log.clone();
@@ -1021,13 +1036,13 @@ impl<D: MoshDisplay> SessionLoop<D> {
                 }
             }
             Ok(outcome @ RecvOutcome::OutOfOrder { .. }) => {
-                if trace {
+                if self.trace {
                     eprintln!("[mosh]   -> out-of-order insert");
                 }
                 apply_recv_outcome(&mut self.sender, outcome, now);
             }
             Ok(other) => {
-                if trace {
+                if self.trace {
                     eprintln!("[mosh]   -> {other:?}");
                 }
             }
@@ -1069,7 +1084,7 @@ impl<D: MoshDisplay> SessionLoop<D> {
     /// guess underline.
     fn retire_predictions(&mut self, echo_ack: u64) -> bool {
         let mut prediction = self.prediction.lock().unwrap();
-        if std::env::var_os("MOSH_TRACE").is_some() {
+        if self.trace {
             eprintln!(
                 "[mosh] retire: echo_ack={echo_ack} frames={:?} cells={}",
                 prediction.frames,
