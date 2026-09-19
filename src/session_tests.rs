@@ -572,6 +572,65 @@ fn torn_fragments_refresh_heard_but_not_the_connecting_flag() {
     client.terminate();
 }
 
+/// The host-byte capture is an opt-out: an embedder that renders via
+/// the display alone can turn it off so the pending buffer stops
+/// growing with the session, while the display feed is untouched.
+#[test]
+fn host_bytes_capture_can_be_turned_off() {
+    let key = Base64Key::parse("7l1cNvxYVkWP1j8zMC08Jg").unwrap();
+    let server = spawn_test_server(key.clone());
+
+    let display = TestDisplay::new(80, 24);
+    let client = MoshSession::connect(
+        Arc::clone(&display),
+        "127.0.0.1",
+        server.addr.port(),
+        &key,
+        |_| {},
+        80,
+        24,
+        false,
+    )
+    .expect("connect");
+
+    // capture ships ON: bytes accumulate for the drainer (back-compat)
+    client.send_input(b"x");
+    assert!(
+        wait_until(3000, || !client.link_health().never_heard),
+        "associate first"
+    );
+    server
+        .outbox
+        .lock()
+        .unwrap()
+        .push(HostInstruction::HostBytes(b"hello".to_vec()));
+    assert!(
+        wait_until(3000, || fed_text(&display).contains("hello")),
+        "the display feed is independent of draining"
+    );
+    assert_eq!(client.take_host_bytes(), b"hello", "capture on by default");
+
+    // turn it off: the display still feeds, the buffer stays empty
+    client.set_host_bytes_capture(false);
+    server
+        .outbox
+        .lock()
+        .unwrap()
+        .push(HostInstruction::HostBytes(b"world".to_vec()));
+    assert!(
+        wait_until(3000, || fed_text(&display).contains("world")),
+        "the display feed must be untouched by the capture flag"
+    );
+    std::thread::sleep(Duration::from_millis(300)); // let any buggy append land
+    assert!(
+        client.take_host_bytes().is_empty(),
+        "capture off must not accumulate host bytes, got {:?}",
+        client.take_host_bytes()
+    );
+    server.stop.store(true, Ordering::Relaxed);
+    client.terminate();
+}
+
 /// P6 regression: the server's echo-ack retires predictions on EVERY
 /// appended state — an echoack-only instruction (no host bytes) is
 /// enough upstream (completeterminal.cc:130-160); the guesses must not

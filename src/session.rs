@@ -194,6 +194,9 @@ struct Shared {
     ports_opened: AtomicU64,
     /// Newest user-stream state the server has acked.
     user_acked: AtomicU64,
+    /// Whether host bytes also accumulate for [`MoshSession::take_host_bytes`]
+    /// (on by default; display-only embedders turn it off).
+    capture_host_bytes: AtomicBool,
 }
 
 impl Shared {
@@ -335,6 +338,7 @@ impl<D: MoshDisplay> MoshSession<D> {
             now_ms: AtomicU64::new(0),
             ports_opened: AtomicU64::new(1),
             user_acked: AtomicU64::new(0),
+            capture_host_bytes: AtomicBool::new(true),
         });
         let pending = Arc::new(Mutex::new(Vec::new()));
         let prediction = Arc::new(Mutex::new(PredictionState {
@@ -544,8 +548,22 @@ impl<D: MoshDisplay> MoshSession<D> {
     /// Drain host bytes the embedder hasn't consumed yet. The in-loop
     /// display advances independently; on a branch rebuild the buffer
     /// carries a FULL repaint, so a linear consumer stays correct.
+    /// Capture can be turned off entirely with
+    /// [`MoshSession::set_host_bytes_capture`].
     pub fn take_host_bytes(&self) -> Vec<u8> {
         std::mem::take(&mut *self.pending_bytes.lock().unwrap())
+    }
+
+    /// Toggle the host-byte capture behind
+    /// [`MoshSession::take_host_bytes`] (on by default). An embedder
+    /// that renders through the display alone should turn it off: the
+    /// pending buffer is unbounded by design, and without a drainer it
+    /// grows with the session's traffic. The display feed is
+    /// unaffected either way.
+    pub fn set_host_bytes_capture(&self, enabled: bool) {
+        self.shared
+            .capture_host_bytes
+            .store(enabled, Ordering::Relaxed);
     }
 
     /// Toggle conservative local echo (Never/Always; default on).
@@ -715,7 +733,9 @@ impl<D: MoshDisplay> SessionLoop<D> {
                     );
                 }
                 display.feed(bytes);
-                self.pending_bytes.lock().unwrap().extend_from_slice(bytes);
+                if self.shared.capture_host_bytes.load(Ordering::Relaxed) {
+                    self.pending_bytes.lock().unwrap().extend_from_slice(bytes);
+                }
             }
             HostEvent::Resize { width, height } => {
                 if self.trace {

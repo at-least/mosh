@@ -42,6 +42,20 @@ Conservative local echo (predicted keystrokes, retired by the server's
 echo-ack) is built in and on by default; toggle with
 `set_prediction(false)`.
 
+## Memory profile
+
+Two buffers grow with the session, and the embedder decides what to do
+about each:
+
+- the **host-byte capture** behind `take_host_bytes()` — unbounded by
+  design so a linear consumer stays correct; drain it regularly, or
+  turn it off with `set_host_bytes_capture(false)` if you render
+  through the display alone;
+- the **synchronized host log** itself, an append-only event log with
+  structural sharing: a session keeps one copy of all its host traffic
+  resident (per-state snapshots are O(1) clones), which is the price of
+  cheap branch rebuilds.
+
 ## Server requirements
 
 `mosh-server` 1.3.2 or newer (the byte-stream model and the three proto
