@@ -319,10 +319,15 @@ message EchoAck     { optional uint64 echo_ack_num = 8; }
   packet) (network.h:139, network.cc:417-422).
 - **Shutdown handshake**: the quitting side sends instructions with
   `new_num = u64::MAX` (§6.1). The peer, on seeing new_num = u64::MAX,
-  acks it and starts its own shutdown; each side gives up after
-  SHUTDOWN_RETRIES (16) tries or ACTIVE_RETRY_TIMEOUT (10 s) of trying,
-  after which the session is over regardless. A client that never
-  completed the handshake warns that mosh-server may still be running.
+  acks it and quits cleanly once that ack has been sent — it does not
+  start its own shutdown (stmclient.cc: "quit if we received and
+  acknowledged a shutdown request", i.e. the transport's
+  `get_counterparty_shutdown_acknowledged()`:
+  `fragmenter.last_ack_sent() == uint64_t(-1)`). The quitting side
+  gives up after SHUTDOWN_RETRIES (16) tries or ACTIVE_RETRY_TIMEOUT
+  (10 s) of trying, after which the session is over regardless. A
+  client that never completed the handshake warns that mosh-server may
+  still be running.
 - **Connection-death UX**: "still connecting" = no remote state number
   yet (nothing heard); mosh surfaces "Nothing received from server on UDP
   port N" and, on quit without a successful round trip, the canonical

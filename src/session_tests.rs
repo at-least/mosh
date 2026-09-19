@@ -41,6 +41,8 @@ struct ServerHandles {
     outbox: Arc<Mutex<Vec<HostInstruction>>>,
     go_silent: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    /// the test wants the SERVER to quit (send new_num = u64::MAX)
+    quit: Arc<AtomicBool>,
     /// every user byte the server has received (latest full stream)
     received: Arc<Mutex<Vec<u8>>>,
     saw_shutdown: Arc<AtomicBool>,
@@ -103,12 +105,14 @@ fn spawn_test_server(key: Base64Key) -> ServerHandles {
     let outbox = Arc::new(Mutex::new(Vec::new()));
     let go_silent = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
+    let quit = Arc::new(AtomicBool::new(false));
     let received = Arc::new(Mutex::new(Vec::new()));
     let saw_shutdown = Arc::new(AtomicBool::new(false));
 
     let outbox_move = Arc::clone(&outbox);
     let silent_move = Arc::clone(&go_silent);
     let stop_move = Arc::clone(&stop);
+    let quit_move = Arc::clone(&quit);
     let received_move = Arc::clone(&received);
     let shutdown_move = Arc::clone(&saw_shutdown);
     std::thread::spawn(move || {
@@ -130,6 +134,11 @@ fn spawn_test_server(key: Base64Key) -> ServerHandles {
             }
             let t = now();
             let silent = silent_move.load(Ordering::Relaxed);
+
+            // the test wants the server itself to quit
+            if quit_move.load(Ordering::Relaxed) && !sender.shutdown_in_progress() {
+                sender.start_shutdown(t);
+            }
 
             // adopt any scripted emissions
             for instruction in outbox_move.lock().unwrap().drain(..) {
@@ -237,6 +246,7 @@ fn spawn_test_server(key: Base64Key) -> ServerHandles {
         outbox,
         go_silent,
         stop,
+        quit,
         received,
         saw_shutdown,
     }
@@ -340,6 +350,52 @@ fn udp_loopback_input_hostbytes_and_clean_shutdown() {
         "client must end cleanly"
     );
     client.join();
+}
+
+/// The `exit` flow: the remote shell quits, mosh-server sends
+/// new_num = u64::MAX, and the client must end CLEANLY once its ack
+/// carrying MAX has gone out — upstream stmclient.cc: "quit if we
+/// received and acknowledged a shutdown request".
+#[test]
+fn server_initiated_shutdown_ends_the_session() {
+    let key = Base64Key::parse("7l1cNvxYVkWP1j8zMC08Jg").unwrap();
+    let server = spawn_test_server(key.clone());
+
+    let events: Arc<Mutex<Vec<SessionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let event_log = Arc::clone(&events);
+    let client = MoshSession::connect(
+        TestDisplay::new(80, 24),
+        "127.0.0.1",
+        server.addr.port(),
+        &key,
+        move |event| event_log.lock().unwrap().push(event),
+        80,
+        24,
+        false,
+    )
+    .expect("connect");
+
+    assert!(
+        wait_until(3000, || !client.link_health().never_heard),
+        "associate before the server quits"
+    );
+
+    // the remote side quits
+    server.quit.store(true, Ordering::Relaxed);
+
+    assert!(
+        wait_until(5000, || {
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e, SessionEvent::Ended { clean: true, .. }))
+        }),
+        "the client must end cleanly when the server shuts down, got {:?}",
+        *events.lock().unwrap()
+    );
+    client.join();
+    server.stop.store(true, Ordering::Relaxed);
 }
 
 #[test]

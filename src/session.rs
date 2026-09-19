@@ -761,6 +761,22 @@ impl<D: MoshDisplay> SessionLoop<D> {
             self.maybe_hop_port(now);
             self.prune_sockets(now);
 
+            // The peer's shutdown was received and our ack carrying it
+            // has gone out — the session is over cleanly, whoever
+            // started the handshake (upstream stmclient.cc: "quit if we
+            // received and acknowledged a shutdown request"; the ack
+            // only carries MAX once the peer's shutdown state landed).
+            if self
+                .sender
+                .counterparty_shutdown_acknowledged(&self.fragmenter)
+            {
+                (self.events)(SessionEvent::Ended {
+                    clean: true,
+                    error: None,
+                });
+                break;
+            }
+
             if self.sender.shutdown_in_progress()
                 && (self.sender.shutdown_acknowledged() || self.sender.shutdown_ack_timed_out(now))
             {
