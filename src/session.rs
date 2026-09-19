@@ -111,13 +111,17 @@ pub struct PredictedCell {
 }
 
 /// The prediction overlay: cells the CLIENT guessed the shell will
-/// echo, plus the frame of the user stream they were typed under
+/// echo, plus the frame of the user stream each was typed under
 /// (echo_ack retires by frame). Loop-side writes, reader-side merges
 /// into frame_region — one lock, no cross-thread callbacks.
 #[derive(Debug, Default)]
 struct PredictionState {
     enabled: bool,
     cells: Vec<PredictedCell>,
+    /// the user-stream frame each cell was predicted under, in the
+    /// same order as `cells` (non-decreasing: bursts are recorded in
+    /// time order and a burst retires whole)
+    frames: Vec<u64>,
     /// shadow (col,row) where the NEXT predicted char would land
     cursor: Option<(i32, i32)>,
 }
@@ -127,7 +131,7 @@ impl PredictionState {
     /// shadow to the next line start, backspace drops the last cell.
     /// Anything else (escape sequences, control bytes) ends the guess
     /// for the burst — mosh's own conservative set.
-    fn feed(&mut self, cols: i32, rows: i32, bytes: &[u8]) {
+    fn feed(&mut self, cols: i32, rows: i32, frame: u64, bytes: &[u8]) {
         for &byte in bytes {
             match byte {
                 0x0D => {
@@ -138,6 +142,7 @@ impl PredictionState {
                     if let Some(last) = self.cells.last() {
                         self.cursor = Some((last.col, last.row));
                         self.cells.pop();
+                        self.frames.pop();
                     }
                 }
                 b if (0x20..0x7F).contains(&b) => {
@@ -148,6 +153,7 @@ impl PredictionState {
                             col,
                             ch: b as char,
                         });
+                        self.frames.push(frame);
                         self.cursor = Some((col + 1, row));
                     }
                 }
@@ -160,8 +166,18 @@ impl PredictionState {
         self.cursor.unwrap_or((0, 0))
     }
 
+    /// Cells confirmed through `echo_ack`: the prefix predicted under
+    /// frames at or below it. Per-cell frames make the retirement exact
+    /// where summed per-burst deltas drifted — a retraction pops its
+    /// cell for good, and a net-zero burst (backspace then a fresh
+    /// char) leaves no bookkeeping to miscount.
+    fn confirmed_prefix_len(&self, echo_ack: u64) -> usize {
+        self.frames.partition_point(|&f| f <= echo_ack)
+    }
+
     fn clear(&mut self) {
         self.cells.clear();
+        self.frames.clear();
         self.cursor = None;
     }
 }
@@ -323,6 +339,7 @@ impl<D: MoshDisplay> MoshSession<D> {
         let prediction = Arc::new(Mutex::new(PredictionState {
             enabled: prediction_on,
             cells: Vec::new(),
+            frames: Vec::new(),
             cursor: None,
         }));
 
@@ -620,8 +637,6 @@ struct SessionLoop<D: MoshDisplay> {
     shared: Arc<Shared>,
     pending_bytes: Arc<Mutex<Vec<u8>>>,
     prediction: Arc<Mutex<PredictionState>>,
-    /// (user state num, signed cell delta predicted under that frame)
-    prediction_frames: Vec<(u64, i64)>,
     events: Box<dyn Fn(SessionEvent) + Send + Sync>,
     origin: Instant,
     // connection-layer state (spec §3)
@@ -665,7 +680,6 @@ impl<D: MoshDisplay> SessionLoop<D> {
             shared,
             pending_bytes,
             prediction,
-            prediction_frames: Vec::new(),
             events,
             origin: Instant::now(),
             expected_receiver_seq: 0,
@@ -1045,44 +1059,27 @@ impl<D: MoshDisplay> SessionLoop<D> {
             // a fresh guess run starts where the engine cursor sits
             prediction.cursor = Some(cursor);
         }
-        let before = prediction.cells.len() as i64;
-        prediction.feed(cols as i32, rows as i32, bytes);
-        let delta = prediction.cells.len() as i64 - before;
-        if delta != 0 {
-            self.prediction_frames.push((frame, delta));
-        }
+        prediction.feed(cols as i32, rows as i32, frame, bytes);
     }
 
     /// The server echoed everything typed up to `echo_ack` (spec §7.2)
     /// — those guesses are now reality, the real bytes already
-    /// rendered. Retire the oldest confirmed cells. Returns true when
-    /// any cell was drained, i.e. the display must repaint to drop the
+    /// rendered. Retire the confirmed prefix. Returns true when any
+    /// cell was drained, i.e. the display must repaint to drop the
     /// guess underline.
     fn retire_predictions(&mut self, echo_ack: u64) -> bool {
+        let mut prediction = self.prediction.lock().unwrap();
         if std::env::var_os("MOSH_TRACE").is_some() {
             eprintln!(
                 "[mosh] retire: echo_ack={echo_ack} frames={:?} cells={}",
-                self.prediction_frames,
-                self.prediction.lock().unwrap().cells.len()
+                prediction.frames,
+                prediction.cells.len()
             );
         }
-        let mut confirmed = 0i64;
-        let mut remaining = Vec::new();
-        for (frame, delta) in std::mem::take(&mut self.prediction_frames) {
-            if frame <= echo_ack {
-                confirmed += delta;
-            } else {
-                remaining.push((frame, delta));
-            }
-        }
-        self.prediction_frames = remaining;
-        if confirmed > 0 {
-            let mut prediction = self.prediction.lock().unwrap();
-            let take = (confirmed as usize).min(prediction.cells.len());
-            prediction.cells.drain(..take);
-            return take > 0;
-        }
-        false
+        let take = prediction.confirmed_prefix_len(echo_ack);
+        prediction.cells.drain(..take);
+        prediction.frames.drain(..take);
+        take > 0
     }
 
     fn maybe_hop_port(&mut self, now: u64) {
@@ -1113,6 +1110,39 @@ impl<D: MoshDisplay> SessionLoop<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pinning for the per-cell retirement bookkeeping: cells carry the
+    /// frame they were predicted under, so a retraction pops its cell
+    /// for good and the confirmed set is exactly the prefix at or under
+    /// the echo-ack — a net-zero burst (backspace then a fresh char)
+    /// leaves nothing to miscount. The e2e regression
+    /// echoack_retires_only_the_confirmed_prefix_of_predictions drove
+    /// this through the wire.
+    #[test]
+    fn prediction_retirement_takes_the_confirmed_prefix() {
+        let mut p = PredictionState {
+            enabled: true,
+            cells: Vec::new(),
+            frames: Vec::new(),
+            cursor: Some((0, 0)),
+        };
+        p.feed(20, 4, 5, b"abc");
+        p.feed(20, 4, 6, b"\x7fd"); // pops 'c', pushes 'd' — net zero
+        let chars = |p: &PredictionState| p.cells.iter().map(|c| c.ch).collect::<String>();
+        assert_eq!(chars(&p), "abd");
+        assert_eq!(p.confirmed_prefix_len(4), 0, "nothing confirmed yet");
+        assert_eq!(
+            p.confirmed_prefix_len(5),
+            2,
+            "\"abc\" confirmed, c already gone"
+        );
+        assert_eq!(p.confirmed_prefix_len(6), 3, "the edit burst confirmed too");
+
+        let take = p.confirmed_prefix_len(5);
+        p.cells.drain(..take);
+        p.frames.drain(..take);
+        assert_eq!(chars(&p), "d", "the never-echoed guess survives");
+    }
 
     /// B1 regression: an out-of-order insert must NOT refresh the
     /// sender's retry window. Upstream returns from `recv()` right

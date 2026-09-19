@@ -43,6 +43,8 @@ struct ServerHandles {
     stop: Arc<AtomicBool>,
     /// the test wants the SERVER to quit (send new_num = u64::MAX)
     quit: Arc<AtomicBool>,
+    /// every client state number the server has appended (Latest)
+    nums: Arc<Mutex<Vec<u64>>>,
     /// every user byte the server has received (latest full stream)
     received: Arc<Mutex<Vec<u8>>>,
     saw_shutdown: Arc<AtomicBool>,
@@ -106,6 +108,7 @@ fn spawn_test_server(key: Base64Key) -> ServerHandles {
     let go_silent = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let quit = Arc::new(AtomicBool::new(false));
+    let nums = Arc::new(Mutex::new(Vec::new()));
     let received = Arc::new(Mutex::new(Vec::new()));
     let saw_shutdown = Arc::new(AtomicBool::new(false));
 
@@ -113,6 +116,7 @@ fn spawn_test_server(key: Base64Key) -> ServerHandles {
     let silent_move = Arc::clone(&go_silent);
     let stop_move = Arc::clone(&stop);
     let quit_move = Arc::clone(&quit);
+    let nums_move = Arc::clone(&nums);
     let received_move = Arc::clone(&received);
     let shutdown_move = Arc::clone(&saw_shutdown);
     std::thread::spawn(move || {
@@ -178,6 +182,7 @@ fn spawn_test_server(key: Base64Key) -> ServerHandles {
                                         if had_diff {
                                             sender.set_data_ack();
                                         }
+                                        nums_move.lock().unwrap().push(num);
                                         let mut log = received_move.lock().unwrap();
                                         log.clear();
                                         for event in receiver.latest_state().events() {
@@ -247,6 +252,7 @@ fn spawn_test_server(key: Base64Key) -> ServerHandles {
         go_silent,
         stop,
         quit,
+        nums,
         received,
         saw_shutdown,
     }
@@ -266,6 +272,15 @@ fn wait_until(deadline_ms: u64, check: impl Fn() -> bool) -> bool {
 /// The display's fed bytes as text (the loopback marker assertions).
 fn fed_text(display: &Arc<Mutex<TestDisplay>>) -> String {
     String::from_utf8_lossy(&display.lock().unwrap().snapshot().fed).into_owned()
+}
+
+/// The predicted cells' characters, in order.
+fn overlay_chars(client: &MoshSession<TestDisplay>) -> String {
+    client
+        .prediction_overlay()
+        .into_iter()
+        .map(|c| c.ch)
+        .collect()
 }
 
 #[test]
@@ -613,6 +628,78 @@ fn echoack_only_state_retires_predictions() {
         wait_until(2000, || client.frame_version() > frames_before),
         "the retirement must signal the embedder (frame_version {} stayed at {frames_before})",
         client.frame_version()
+    );
+    server.stop.store(true, Ordering::Relaxed);
+    client.terminate();
+}
+
+/// The echo-ack must retire exactly the confirmed PREFIX of the
+/// predictions. Regression: retirement summed per-burst deltas, so a
+/// burst that nets zero cells (backspace then a fresh char) and
+/// unconfirmed retractions let the confirmed count spill forward —
+/// echoing "abc" also erased the later, never-echoed "d".
+#[test]
+fn echoack_retires_only_the_confirmed_prefix_of_predictions() {
+    let key = Base64Key::parse("7l1cNvxYVkWP1j8zMC08Jg").unwrap();
+    let server = spawn_test_server(key.clone());
+
+    let client = MoshSession::connect(
+        TestDisplay::new(20, 4),
+        "127.0.0.1",
+        server.addr.port(),
+        &key,
+        |_| {},
+        20,
+        4,
+        true, // prediction ON
+    )
+    .expect("connect");
+
+    // associate; the server never echoes keystrokes, so predictions
+    // only retire through the EchoAck this test scripts
+    client.send_input(b"x");
+    assert!(
+        wait_until(3000, || !client.link_health().never_heard),
+        "associate first"
+    );
+    // a clean slate: drop the association keystroke's guess
+    client.set_prediction(false);
+    client.set_prediction(true);
+
+    // burst 1: "abc" — the live server appends its state; that state's
+    // number is exactly the frame the burst was predicted under
+    client.send_input(b"abc");
+    assert!(
+        wait_until(1000, || overlay_chars(&client) == "abc"),
+        "abc must be predicted first, got {:?}",
+        client.prediction_overlay()
+    );
+    assert!(
+        wait_until(3000, || server.received.lock().unwrap().ends_with(b"abc")),
+        "the abc state must reach the server"
+    );
+    let ack_through = *server.nums.lock().unwrap().last().expect("a client state");
+
+    // burst 2: backspace then "d" — typed after the abc state went out,
+    // so it rides a strictly later frame
+    client.send_input(b"\x7fd");
+    assert!(
+        wait_until(1000, || overlay_chars(&client) == "abd"),
+        "cells after the edit, got {:?}",
+        client.prediction_overlay()
+    );
+
+    // the server echoed "abc" only — never the backspace or the "d"
+    server
+        .outbox
+        .lock()
+        .unwrap()
+        .push(HostInstruction::EchoAck(ack_through));
+
+    assert!(
+        wait_until(4000, || overlay_chars(&client) == "d"),
+        "the echo-ack must retire exactly a,b — d was never echoed (got {:?})",
+        client.prediction_overlay()
     );
     server.stop.store(true, Ordering::Relaxed);
     client.terminate();
