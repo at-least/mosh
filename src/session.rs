@@ -806,6 +806,12 @@ impl<D: MoshDisplay> SessionLoop<D> {
             // started the handshake (upstream stmclient.cc: "quit if we
             // received and acknowledged a shutdown request"; the ack
             // only carries MAX once the peer's shutdown state landed).
+            // Deliberate order deviation: upstream checks this LAST,
+            // after its own shutdown-acknowledged and timeout breaks —
+            // so a timed-out own handshake reports unclean even when
+            // the peer demonstrably quit. Here the peer's acknowledged
+            // shutdown wins with clean: true; the handshake did
+            // complete, on the peer's initiative.
             if self
                 .sender
                 .counterparty_shutdown_acknowledged(&self.fragmenter)

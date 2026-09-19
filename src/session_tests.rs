@@ -622,10 +622,10 @@ fn host_bytes_capture_can_be_turned_off() {
         "the display feed must be untouched by the capture flag"
     );
     std::thread::sleep(Duration::from_millis(300)); // let any buggy append land
+    let pending = client.take_host_bytes();
     assert!(
-        client.take_host_bytes().is_empty(),
-        "capture off must not accumulate host bytes, got {:?}",
-        client.take_host_bytes()
+        pending.is_empty(),
+        "capture off must not accumulate host bytes, got {pending:?}"
     );
     server.stop.store(true, Ordering::Relaxed);
     client.terminate();
