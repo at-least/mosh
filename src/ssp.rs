@@ -272,6 +272,27 @@ impl Default for EventLog {
     }
 }
 
+impl Drop for EventLog {
+    fn drop(&mut self) {
+        // The default Arc drop glue recurses once per node down the
+        // parent chain, and the chain grows with the session — a long
+        // session overflowed the loop thread's stack at teardown (the
+        // deep_event_log_drop regression aborts there). Unwind by hand:
+        // each exclusively-owned node surrenders its parent before it
+        // goes, so the walk uses constant stack; a shared node stops
+        // the walk (its Arc drop only decrements the count, and the
+        // owner that drops last finishes the chain).
+        let mut node = self.node.take();
+        while let Some(arc) = node {
+            if let Ok(mut owned) = Arc::try_unwrap(arc) {
+                node = owned.parent.take();
+            } else {
+                node = None;
+            }
+        }
+    }
+}
+
 /// The server-synchronized state as the client holds it (spec §7.2).
 ///
 /// The client's copy of the server state is a pure EVENT LOG (not an
@@ -1126,6 +1147,50 @@ mod tests {
         assert!(
             empty_shutdown_acks >= 1,
             "shutdown must drive empty acks through the saturated queue"
+        );
+    }
+
+    /// Dropping a long EventLog chain must not recurse per node. The
+    /// default Arc drop glue walks the parent chain one stack frame per
+    /// node, and a session's log grows without bound — the loop thread
+    /// died with a process-fatal stack overflow at teardown once a
+    /// session accumulated enough host events (debug ~7k, release ~60k
+    /// on a 2 MiB stack). The deep drop runs in a CHILD PROCESS re-exec
+    /// of this suite on a 64 KiB stack: a stack overflow is a fatal
+    /// abort, not a catchable panic, so the witness is the child's
+    /// exit status.
+    #[test]
+    fn deep_event_log_drop_does_not_overflow_the_stack() {
+        if std::env::var_os("MOSH_ELOG_DEEP_DROP").is_some() {
+            let handle = std::thread::Builder::new()
+                .stack_size(64 * 1024)
+                .spawn(|| {
+                    let mut log = EventLog::new();
+                    for i in 0..50_000u32 {
+                        log.push(HostEvent::Bytes(vec![b'x'; (i % 5) as usize + 1]));
+                    }
+                    drop(log);
+                })
+                .unwrap();
+            handle.join().expect("deep drop survived a 64 KiB stack");
+            println!("deep drop survived");
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(exe)
+            .args([
+                "ssp::tests::deep_event_log_drop_does_not_overflow_the_stack",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("MOSH_ELOG_DEEP_DROP", "1")
+            .output()
+            .expect("re-exec the test binary");
+        let ran = String::from_utf8_lossy(&output.stdout).contains("deep drop survived");
+        assert!(
+            output.status.success() && ran,
+            "the child must run the 50k-event drop on a 64 KiB stack and survive \
+             (exit: {output:?})"
         );
     }
 
