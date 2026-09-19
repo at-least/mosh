@@ -559,7 +559,8 @@ impl<D: MoshDisplay> MoshSession<D> {
     /// that renders through the display alone should turn it off: the
     /// pending buffer is unbounded by design, and without a drainer it
     /// grows with the session's traffic. The display feed is
-    /// unaffected either way.
+    /// unaffected either way, and bytes already buffered stay until
+    /// the next [`MoshSession::take_host_bytes`] drains them.
     pub fn set_host_bytes_capture(&self, enabled: bool) {
         self.shared
             .capture_host_bytes

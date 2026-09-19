@@ -327,7 +327,11 @@ message EchoAck     { optional uint64 echo_ack_num = 8; }
   gives up after SHUTDOWN_RETRIES (16) tries or ACTIVE_RETRY_TIMEOUT
   (10 s) of trying, after which the session is over regardless. A
   client that never completed the handshake warns that mosh-server may
-  still be running.
+  still be running. Order note: upstream's loop checks the peer-ack
+  exit LAST, after its own acked and timeout breaks, so a timed-out
+  own handshake reports unclean even when the peer demonstrably quit;
+  conch checks it FIRST — the peer's acknowledged shutdown ends the
+  session clean regardless of who started the handshake.
 - **Connection-death UX**: "still connecting" = no remote state number
   yet (nothing heard); mosh surfaces "Nothing received from server on UDP
   port N" and, on quit without a successful round trip, the canonical
